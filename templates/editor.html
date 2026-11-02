@@ -89,6 +89,19 @@ function runSimulation() {
             return;
         }
         const data = await res.json();
+        
+        // Check if script has no devices
+        if (!data.has_devices) {
+            // Show print output or message in editor
+            if (data.print_output) {
+                alert(`Script Output:\n\n${data.print_output}\n\n${data.message}`);
+            } else {
+                alert(data.message);
+            }
+            return;
+        }
+        
+        // If has devices, redirect to simulation
         localStorage.setItem("simData", JSON.stringify(data));
         window.location.href = "/simulation";
     })
@@ -247,7 +260,7 @@ function deleteNetwork(filename) {
 }
 
 function closeNetworksList() {
-    const modal = document.getElementById('networks-modal');
+    const modal = document.getElementById('networksModal');
     if (modal) modal.remove();
 }
 

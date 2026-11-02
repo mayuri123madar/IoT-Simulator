@@ -45,29 +45,58 @@ class IoTProtocol:
         self.power_consumption = params.get('power_consumption', 0.0)
         
     def calculate_latency(self, data_size):
-        """Calculate protocol-specific latency based on data size"""
-        # Original latency calculation methodology
-        base_latency = 0.001  # 1ms base latency
-        protocol_factor = {
-            'I2C': 0.01,
-            'SPI': 0.005,
-            'UART': 0.02,
-            'WiFi': 0.05,
-            'BLE': 0.03,
-            'LoRa': 0.1,
-            'MQTT': 0.08
-        }.get(self.protocol_type, 0.05)
+        """Calculate protocol-specific latency using new protocol system"""
+        # Import new protocol classes
+        from protocols import I2C, SPI, UART, CAN, WiFi, BLE, Zigbee, LoRa, MQTT, CoAP
         
-        return base_latency + (data_size * protocol_factor)
+        # Create protocol instance based on type
+        protocol_map = {
+            'I2C': I2C,
+            'SPI': SPI,
+            'UART': UART,
+            'CAN': CAN,
+            'WiFi': WiFi,
+            'BLE': BLE,
+            'Zigbee': Zigbee,
+            'LoRa': LoRa,
+            'MQTT': MQTT,
+            'CoAP': CoAP
+        }
+        
+        protocol_class = protocol_map.get(self.protocol_type)
+        if protocol_class:
+            protocol = protocol_class()
+            return protocol.airtime(data_size)
+        else:
+            # Fallback for unknown protocols
+            return 0.001 + (data_size * 0.05)
     
     def calculate_energy(self, data_size, distance):
-        """Calculate energy consumption for data transmission"""
-        # Original energy calculation methodology
-        base_energy = self.power_consumption
-        distance_factor = distance * 0.01
-        size_factor = data_size * 0.001
+        """Calculate energy consumption using new protocol system"""
+        # Import new protocol classes
+        from protocols import I2C, SPI, UART, CAN, WiFi, BLE, Zigbee, LoRa, MQTT, CoAP
         
-        return base_energy + distance_factor + size_factor
+        # Create protocol instance based on type
+        protocol_map = {
+            'I2C': I2C,
+            'SPI': SPI,
+            'UART': UART,
+            'CAN': CAN,
+            'WiFi': WiFi,
+            'BLE': BLE,
+            'Zigbee': Zigbee,
+            'LoRa': LoRa,
+            'MQTT': MQTT,
+            'CoAP': CoAP
+        }
+        
+        protocol_class = protocol_map.get(self.protocol_type)
+        if protocol_class:
+            protocol = protocol_class()
+            return protocol.tx_energy(data_size)
+        else:
+            # Fallback for unknown protocols
+            return self.power_consumption + (distance * 0.01) + (data_size * 0.001)
 
 
 class IoTNetwork:

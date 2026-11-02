@@ -7,6 +7,40 @@ from io import StringIO
 from datetime import datetime
 import re
 
+# Import new protocol system
+from protocols import I2C, SPI, UART, CAN, WiFi, BLE, Zigbee, LoRa, MQTT, CoAP
+from energy_model import EnergyModel
+from recommendation_engine import RecommendationEngine
+
+# Protocol factory
+def create_protocol(protocol_name, **kwargs):
+    """
+    Create a protocol instance by name
+    Args:
+        protocol_name: Name of protocol (I2C, SPI, UART, CAN, WiFi, BLE, Zigbee, LoRa, MQTT, CoAP)
+        **kwargs: Protocol-specific parameters
+    Returns:
+        Protocol instance
+    """
+    protocol_map = {
+        'I2C': I2C,
+        'SPI': SPI,
+        'UART': UART,
+        'CAN': CAN,
+        'WiFi': WiFi,
+        'BLE': BLE,
+        'Zigbee': Zigbee,
+        'LoRa': LoRa,
+        'MQTT': MQTT,
+        'CoAP': CoAP
+    }
+    
+    protocol_class = protocol_map.get(protocol_name)
+    if protocol_class:
+        return protocol_class(**kwargs)
+    else:
+        raise ValueError(f"Unknown protocol: {protocol_name}")
+
 # OpenAI API integration (optional)
 try:
     import openai
@@ -34,6 +68,7 @@ class IoTNetwork:
         self.nodes = {}
         self.edges = []
         self.states = {}
+        self.dead_nodes = set()  # Track dead nodes for rerouting
     
     def add_node(self, node_obj):
         self.nodes[node_obj.id] = node_obj.type
@@ -46,19 +81,103 @@ class IoTNetwork:
         if target_obj.id not in self.nodes:
             raise ValueError(f"Target node '{target_obj.id}' does not exist")
         self.edges.append((source_obj.id, target_obj.id))
+    
+    def mark_node_dead(self, node_id):
+        """Mark a node as dead (battery depleted)"""
+        if node_id in self.nodes:
+            self.dead_nodes.add(node_id)
+            self.states[node_id] = 'dead'
+    
+    def get_alternative_path(self, source_id, target_id):
+        """
+        Find alternative path avoiding dead nodes
+        Returns list of node IDs forming the path, or None if no path exists
+        """
+        if source_id not in self.nodes or target_id not in self.nodes:
+            return None
+        
+        if source_id in self.dead_nodes or target_id in self.dead_nodes:
+            return None
+        
+        # BFS to find path avoiding dead nodes
+        from collections import deque
+        queue = deque([(source_id, [])])
+        visited = set()
+        
+        while queue:
+            current, path = queue.popleft()
+            
+            if current == target_id:
+                return path + [current]
+            
+            if current in visited or current in self.dead_nodes:
+                continue
+            
+            visited.add(current)
+            
+            # Find neighbors
+            neighbors = [edge[1] for edge in self.edges if edge[0] == current]
+            neighbors += [edge[0] for edge in self.edges if edge[1] == current]
+            
+            for neighbor in neighbors:
+                if neighbor not in visited and neighbor not in self.dead_nodes:
+                    queue.append((neighbor, path + [current]))
+        
+        return None  # No path found
+
+# Mock RPi.GPIO module for simulation
+class MockGPIO:
+    """Mock GPIO module for simulation purposes"""
+    BCM = 'BCM'
+    BOARD = 'BOARD'
+    OUT = 'OUT'
+    IN = 'IN'
+    HIGH = 1
+    LOW = 0
+    
+    @staticmethod
+    def setmode(mode):
+        pass
+    
+    @staticmethod
+    def setup(channel, direction):
+        pass
+    
+    @staticmethod
+    def output(channel, value):
+        pass
+    
+    @staticmethod
+    def input(channel):
+        return 0
+    
+    @staticmethod
+    def cleanup():
+        pass
+
+# Mock RPi module
+class MockRPi:
+    GPIO = MockGPIO()
+
+# Initialize recommendation engine
+recommendation_engine = RecommendationEngine()
 
 # Base IoT Device Class
 class IoTDevice:
-    def __init__(self, device_id, device_type, network_ref=None):
+    def __init__(self, device_id, device_type, network_ref=None, protocol=None, battery_mah=0):
         self.id = device_id
         self.type = device_type
         self.state = "off"
+        self.protocol = protocol
         # Use provided network or global network
         if network_ref:
             self.network = network_ref
         else:
             # Don't use global network here - it might not exist yet
             self.network = None
+        
+        # Initialize energy model
+        self.energy_model = EnergyModel(device_type, battery_mah)
     
     def turn_on(self):
         self.state = "on"
@@ -88,8 +207,28 @@ class IoTDevice:
             return {"device_id": self.id, "status": self.state}
     
     def send_data(self, data):
-        """Simulate sending data from device"""
+        """Simulate sending data from device using protocol"""
+        if self.protocol:
+            # Calculate energy and latency using protocol
+            data_size = len(str(data))  # Simplified data size
+            airtime = self.protocol.airtime(data_size)
+            tx_energy = self.protocol.tx_energy(data_size)
+            
+            # Add to energy model
+            self.energy_model.add_tx_energy(airtime)
+            
+            return {
+                "device_id": self.id, 
+                "data": data, 
+                "sent": True,
+                "airtime_s": airtime,
+                "energy_mj": tx_energy
+            }
         return {"device_id": self.id, "data": data, "sent": True}
+    
+    def set_protocol(self, protocol):
+        """Set the protocol for this device"""
+        self.protocol = protocol
 
 # Specific IoT Device Classes
 class Sensor(IoTDevice):
@@ -238,8 +377,7 @@ def validate_python_script(script: str):
         # Create restricted globals with test-specific device classes
         restricted_globals = {
             '__builtins__': {
-                '__import__': __import__,
-                'print': print,
+                # Remove __import__ for security - prevent arbitrary imports
                 'len': len,
                 'str': str,
                 'int': int,
@@ -250,9 +388,31 @@ def validate_python_script(script: str):
                 'range': range,
                 'enumerate': enumerate,
                 'zip': zip,
+                'abs': abs,
+                'min': min,
+                'max': max,
+                'sum': sum,
+                'round': round,
             },
+            'print': print,  # Standard print for validation
             'IoTNetwork': IoTNetwork,
             'IoTDevice': IoTDevice,
+            # Add mock RPi module for GPIO simulation
+            'RPi': MockRPi(),
+            'GPIO': MockGPIO(),
+            # Add protocol factory and protocol classes
+            'create_protocol': create_protocol,
+            'I2C': I2C,
+            'SPI': SPI,
+            'UART': UART,
+            'CAN': CAN,
+            'WiFi': WiFi,
+            'BLE': BLE,
+            'Zigbee': Zigbee,
+            'LoRa': LoRa,
+            'MQTT': MQTT,
+            'CoAP': CoAP,
+            'EnergyModel': EnergyModel,
             # Original devices
             'Sensor': make_device_class('Sensor'),
             'Gateway': make_device_class('Gateway'),
@@ -300,10 +460,7 @@ def validate_python_script(script: str):
         finally:
             sys.stdout = old_stdout
         
-        # Check if test_network has nodes
-        if not test_network.nodes:
-            return False, "No devices created in script"
-        
+        # Allow scripts without devices - only check syntax
         return True, "Valid Python script"
         
     except SyntaxError as e:
@@ -324,6 +481,20 @@ def simulate():
     # Execute script to get network data
     network = IoTNetwork()
     
+    # Capture print output
+    print_output = []
+    def custom_print(*args, **kwargs):
+        output = ' '.join(str(arg) for arg in args)
+        print_output.append(output)
+        # Also print to console for debugging
+        print(f"[CAPTURED]: {output}")
+        return output  # Return for debugging
+    
+    # Test custom print
+    print(f"[DEBUG] Testing custom_print...")
+    custom_print("Test message")
+    print(f"[DEBUG] print_output after test: {print_output}")
+    
     # Create device classes that automatically register with network
     def make_device_class(device_type):
         class NetworkDevice(IoTDevice):
@@ -335,8 +506,8 @@ def simulate():
     
     restricted_globals = {
         '__builtins__': {
-            '__import__': __import__,
-            'print': print,
+            # Remove __import__ for security - prevent arbitrary imports
+            # 'print': custom_print,  # Custom print for capturing output
             'len': len,
             'str': str,
             'int': int,
@@ -347,9 +518,31 @@ def simulate():
             'range': range,
             'enumerate': enumerate,
             'zip': zip,
+            'abs': abs,
+            'min': min,
+            'max': max,
+            'sum': sum,
+            'round': round,
         },
+        'print': custom_print,  # Custom print outside __builtins__
         'IoTNetwork': IoTNetwork,
         'IoTDevice': IoTDevice,
+        # Add mock RPi module for GPIO simulation
+        'RPi': MockRPi(),
+        'GPIO': MockGPIO(),
+        # Add protocol factory and protocol classes
+        'create_protocol': create_protocol,
+        'I2C': I2C,
+        'SPI': SPI,
+        'UART': UART,
+        'CAN': CAN,
+        'WiFi': WiFi,
+        'BLE': BLE,
+        'Zigbee': Zigbee,
+        'LoRa': LoRa,
+        'MQTT': MQTT,
+        'CoAP': CoAP,
+        'EnergyModel': EnergyModel,
         # Original devices
         'Sensor': make_device_class('Sensor'),
         'Gateway': make_device_class('Gateway'),
@@ -389,8 +582,11 @@ def simulate():
     }
     
     try:
+        print(f"[DEBUG] Executing script...")
         exec(script, restricted_globals)
+        print(f"[DEBUG] Script execution completed")
     except Exception as e:
+        print(f"[DEBUG] Execution error: {e}")
         return jsonify({"error": f"Execution error: {e}"}), 400
 
     # Build cytoscape elements
@@ -416,11 +612,32 @@ def simulate():
                 }
             })
 
-    return jsonify({
+    # Check if any devices were created
+    has_devices = len(network.nodes) > 0
+    
+    # Debug logging
+    print(f"[DEBUG] has_devices: {has_devices}")
+    print(f"[DEBUG] print_output length: {len(print_output)}")
+    print(f"[DEBUG] print_output: {print_output}")
+    
+    # Build response
+    response_data = {
         "elements": elements,
         "states": network.states,
-        "script": script  # Add script data to response
-    })
+        "script": script,
+        "has_devices": has_devices
+    }
+    
+    # If no devices, add print output or no devices message
+    if not has_devices:
+        if print_output:
+            response_data["print_output"] = "\n".join(print_output)
+            response_data["message"] = "No IoT devices in script, but print output captured"
+        else:
+            response_data["print_output"] = ""
+            response_data["message"] = "No IoT devices in script and no print output"
+    
+    return jsonify(response_data)
 
 # ---------- SAVE/LOAD NETWORK FUNCTIONALITY ----------
 @app.route("/save_network", methods=["POST"])
@@ -466,7 +683,24 @@ def load_network():
         if not filename:
             return jsonify({"error": "No filename provided"}), 400
         
+        # Validate filename - prevent path traversal
+        # Only allow alphanumeric, underscore, hyphen, and dot
+        if not re.match(r'^[\w\-\.]+$', filename):
+            return jsonify({"error": "Invalid filename"}), 400
+        
+        # Ensure filename ends with .json
+        if not filename.endswith('.json'):
+            return jsonify({"error": "Filename must end with .json"}), 400
+        
+        # Prevent path traversal
+        if '..' in filename or filename.startswith('/'):
+            return jsonify({"error": "Invalid filename"}), 400
+        
         filepath = os.path.join(NETWORKS_DIR, filename)
+        
+        # Ensure filepath is within NETWORKS_DIR
+        if not os.path.abspath(filepath).startswith(os.path.abspath(NETWORKS_DIR)):
+            return jsonify({"error": "Invalid filename"}), 400
         
         if not os.path.exists(filepath):
             return jsonify({"error": "Network file not found"}), 404
@@ -515,7 +749,24 @@ def delete_network():
         if not filename:
             return jsonify({"error": "No filename provided"}), 400
         
+        # Validate filename - prevent path traversal
+        # Only allow alphanumeric, underscore, hyphen, and dot
+        if not re.match(r'^[\w\-\.]+$', filename):
+            return jsonify({"error": "Invalid filename"}), 400
+        
+        # Ensure filename ends with .json
+        if not filename.endswith('.json'):
+            return jsonify({"error": "Filename must end with .json"}), 400
+        
+        # Prevent path traversal
+        if '..' in filename or filename.startswith('/'):
+            return jsonify({"error": "Invalid filename"}), 400
+        
         filepath = os.path.join(NETWORKS_DIR, filename)
+        
+        # Ensure filepath is within NETWORKS_DIR
+        if not os.path.abspath(filepath).startswith(os.path.abspath(NETWORKS_DIR)):
+            return jsonify({"error": "Invalid filename"}), 400
         
         if not os.path.exists(filepath):
             return jsonify({"error": "Network file not found"}), 404
@@ -655,6 +906,71 @@ def delete_trace_file():
         
     except Exception as e:
         return jsonify({"error": f"Failed to delete trace file: {e}"}), 500
+
+# ---------- RECOMMENDATION ENGINE ENDPOINTS ----------
+@app.route("/recommend_protocol", methods=["POST"])
+def recommend_protocol():
+    """Recommend protocol based on requirements"""
+    try:
+        data = request.json or {}
+        requirements = data.get("requirements", {})
+        
+        recommendations = recommendation_engine.recommend_protocol(requirements)
+        
+        return jsonify({
+            "recommendations": recommendations,
+            "count": len(recommendations)
+        })
+        
+    except Exception as e:
+        return jsonify({"error": f"Recommendation failed: {e}"}), 500
+
+@app.route("/compare_protocols", methods=["POST"])
+def compare_protocols():
+    """Compare multiple protocols with actual calculations"""
+    try:
+        data = request.json or {}
+        protocol_names = data.get("protocols", [])
+        payload_bytes = data.get("payload_bytes", 100)
+        distance_m = data.get("distance_m", 10)
+        
+        if not protocol_names:
+            return jsonify({"error": "No protocols specified"}), 400
+        
+        comparison = recommendation_engine.compare_protocols(protocol_names, payload_bytes, distance_m)
+        
+        return jsonify({
+            "comparison": comparison,
+            "parameters": {
+                "payload_bytes": payload_bytes,
+                "distance_m": distance_m
+            }
+        })
+        
+    except Exception as e:
+        return jsonify({"error": f"Comparison failed: {e}"}), 500
+
+@app.route("/recommend_topology", methods=["POST"])
+def recommend_topology():
+    """Recommend network topology based on requirements"""
+    try:
+        data = request.json or {}
+        num_devices = data.get("num_devices", 10)
+        area_size_m2 = data.get("area_size_m2", 100)
+        requirements = data.get("requirements", {})
+        
+        recommendations = recommendation_engine.recommend_topology(num_devices, area_size_m2, requirements)
+        
+        return jsonify({
+            "recommendations": recommendations,
+            "parameters": {
+                "num_devices": num_devices,
+                "area_size_m2": area_size_m2
+            }
+        })
+        
+    except Exception as e:
+        return jsonify({"error": f"Topology recommendation failed: {e}"}), 500
 
 # ---------- AI CHATBOT SYSTEM ----------
 
@@ -843,6 +1159,9 @@ actuator.turn_on()
 KNOWLEDGE_BASE = {
     "what is": "The IoT Network Simulator is a Python-based simulation platform for designing, testing, and analyzing IoT networks. It features: 1) Web-based editor for writing IoT scripts, 2) Multi-layer network visualization (Device, Protocol, Energy, DataFlow), 3) Support for 10 IoT protocols (I2C, SPI, UART, WiFi, BLE, LoRa, Zigbee, MQTT, CoAP, CAN), 4) Resource-constrained device modeling, 5) Energy-aware simulation with performance metrics, 6) Single-line trace file generation for analysis, 7) AI-powered chatbot for script generation and Q&A.",
     "simulator": "The IoT Network Simulator is a Python-based simulation platform for designing, testing, and analyzing IoT networks. It features: 1) Web-based editor for writing IoT scripts, 2) Multi-layer network visualization (Device, Protocol, Energy, DataFlow), 3) Support for 10 IoT protocols (I2C, SPI, UART, WiFi, BLE, LoRa, Zigbee, MQTT, CoAP, CAN), 4) Resource-constrained device modeling, 5) Energy-aware simulation with performance metrics, 6) Single-line trace file generation for analysis, 7) AI-powered chatbot for script generation and Q&A.",
+    "purpose": "The purpose of this IoT simulator is to provide a comprehensive platform for designing, testing, and analyzing IoT networks without requiring physical hardware. It enables researchers, students, and developers to prototype IoT systems, analyze protocol performance, and visualize network behavior in a controlled environment.",
+    "goal": "The goal of this IoT simulator is to bridge the gap between theoretical IoT concepts and practical implementation by providing a realistic simulation environment that models device behavior, protocol characteristics, energy consumption, and network topology.",
+    "features": "Key features include: Web-based Python editor, Multi-layer visualization (Device/Protocol/Energy/DataFlow), 10 IoT protocols (I2C/SPI/UART/WiFi/BLE/LoRa/Zigbee/MQTT/CoAP/CAN), Resource-constrained device modeling, Energy-aware simulation, Performance metrics, Trace file generation, AI chatbot assistant, Import support for Python modules.",
     "how to use": "To use the IoT simulator: 1) Write your script in the editor using device classes like Arduino, Sensor, LED. 2) Click 'Run Simulation' to execute. 3) View the network visualization. 4) Use multi-layer view by clicking 'Layer' button.",
     "multi-layer": "Multi-layer visualization shows different aspects: Device layer (device types), Protocol layer (communication protocols), Energy layer (power consumption), DataFlow layer (data intensity). Click 'Layer' button to cycle through them.",
     "export": "To export data: Click 'Export' button to download JSON file with complete simulation data including devices, protocols, and performance metrics.",
@@ -853,31 +1172,68 @@ KNOWLEDGE_BASE = {
     "import": "You can now use Python imports in the editor! Import modules like json, datetime, math, etc. for advanced scripting.",
     "script": "Scripts use simple Python syntax with device classes. Example: arduino = Arduino('uno'); sensor = Sensor('temp'); sensor.connect(arduino); arduino.turn_on()",
     "error": "Common errors: Check device names are unique, ensure devices are connected before use, verify turn_on() is called before operations.",
+    "help": "I can help you with: Creating IoT scripts for any scenario (smart home, industrial, smart city, etc.), Answering questions about simulator features, Troubleshooting script errors, Explaining protocols and devices, Providing usage examples. Just ask your question!",
+    "support": "Supported features: Script generation, Q&A about simulator, Multi-layer visualization, Protocol simulation, Device modeling, Energy analysis, Trace file generation, Export functionality, Import support, AI chatbot assistance.",
+    "example": "Example script: arduino = Arduino('uno'); sensor = Sensor('temp'); led = LED('status'); sensor.connect(arduino); arduino.connect(led); arduino.turn_on(); sensor.turn_on(); led.turn_on();",
+    "tutorial": "Quick tutorial: 1) Open editor at /editor, 2) Write script using device classes, 3) Click Run Simulation, 4) View network visualization, 5) Use Layer button for different views, 6) Click Export for JSON data.",
+    "network": "Network creation: Use device classes (Arduino, Sensor, LED, etc.), Connect devices with .connect() method, Turn on devices with .turn_on(), Run simulation to visualize network.",
+    "connection": "Device connections: Use device1.connect(device2) to create connections. Devices must be created before connecting. Example: sensor = Sensor('temp'); arduino = Arduino('uno'); sensor.connect(arduino);",
+    "visualization": "Visualization features: Interactive network graph, Multi-layer views (Device/Protocol/Energy/DataFlow), Packet animation, Real-time status updates, Zoom and pan controls.",
+    "energy": "Energy simulation: Models power consumption based on device type and protocol, Calculates energy per transmission, Shows energy metrics in visualization, Available in Energy layer view.",
+    "latency": "Latency modeling: Calculates transmission delay based on protocol characteristics, Shows latency in trace files, Displays in performance metrics, Varies by protocol type.",
+    "performance": "Performance metrics: Total energy consumption, Average latency, Packet transmission count, Device utilization, Network throughput. Available in export JSON.",
+    "advanced": "Advanced features: Python import support, Custom device classes, Protocol library integration, Trace file analysis, Performance optimization, Network topology design.",
+    "beginner": "For beginners: Start with simple scripts (sensor + LED), Use Load Example button, Try the AI chatbot for help, Read the documentation, Experiment with different devices.",
+    "student": "For students: Great for learning IoT concepts, Practice network design, Understand protocol behavior, Analyze energy consumption, Prepare for projects.",
+    "research": "For researchers: Analyze protocol performance, Compare network topologies, Study energy efficiency, Generate trace data, Validate IoT algorithms.",
 }
 
 def generate_script(user_query):
     """Generate IoT simulator script based on user query"""
     query_lower = user_query.lower()
     
-    # Check for script generation keywords
-    script_keywords = {
-        "smart home": "smart home",
-        "home": "smart home",
-        "temperature": "smart home",
-        "industrial": "industrial",
-        "plc": "industrial",
-        "factory": "industrial",
-        "smart city": "smart city",
-        "traffic": "smart city",
-        "city": "smart city",
-        "simple": "simple",
-        "basic": "simple",
-        "beginner": "simple"
-    }
-    
-    for keyword, template_key in script_keywords.items():
-        if keyword in query_lower:
-            return SCRIPT_TEMPLATES[template_key], "script"
+    # Check if user wants interactive script generation
+    interactive_keywords = ["create", "generate", "make", "build", "script", "network", "iot", "setup"]
+    if any(keyword in query_lower for keyword in interactive_keywords):
+        # Check if specific type is mentioned
+        script_keywords = {
+            "smart home": "smart home",
+            "home": "smart home",
+            "temperature": "smart home",
+            "industrial": "industrial",
+            "plc": "industrial",
+            "factory": "industrial",
+            "smart city": "smart city",
+            "traffic": "smart city",
+            "city": "smart city",
+            "simple": "simple",
+            "basic": "simple",
+            "beginner": "simple"
+        }
+        
+        for keyword, template_key in script_keywords.items():
+            if keyword in query_lower:
+                return SCRIPT_TEMPLATES[template_key], "script"
+        
+        # If no specific type, ask for details
+        interactive_response = """🔧 I'll help you create a custom IoT script!
+
+**What type of IoT network do you want to create?**
+
+**1. Smart Home** - Temperature sensors, LEDs, home automation
+   Type: "smart home"
+
+**2. Industrial IoT** - PLCs, sensors, gateways, factory automation
+   Type: "industrial"
+
+**3. Smart City** - Traffic cameras, air sensors, street lights
+   Type: "smart city"
+
+**4. Simple Setup** - Basic sensor and actuator
+   Type: "simple"
+
+Just tell me the type, and I'll generate the script for you! 🚀"""
+        return interactive_response, "qa"
     
     # Default to simple script if no match
     return SCRIPT_TEMPLATES["simple"], "script"
@@ -886,37 +1242,153 @@ def answer_question(user_query):
     """Answer questions about the IoT simulator"""
     query_lower = user_query.lower()
     
-    # Check knowledge base
+    # Check for greetings - show menu
+    greetings = ["hi", "hello", "hey", "hii", "helo", "greetings", "good morning", "good afternoon", "good evening"]
+    if any(greeting in query_lower for greeting in greetings):
+        menu_response = """👋 Hello! I'm your IoT Simulator AI Assistant!
+
+**What can I help you with?**
+
+**1️⃣ Script Generation**
+   - "Create a script"
+   - "Generate IoT network"
+   - "Make a smart home setup"
+
+**2️⃣ Learn About Simulator**
+   - "What is this simulator?"
+   - "What are the features?"
+   - "How does it work?"
+
+**3️⃣ Get Help Using It**
+   - "How do I use it?"
+   - "How to create devices?"
+   - "How to visualize network?"
+
+**4️⃣ Technical Details**
+   - "What devices are available?"
+   - "What protocols are supported?"
+   - "How does energy simulation work?"
+
+**5️⃣ Troubleshooting**
+   - "Fix my error"
+   - "Why is my script not working?"
+   - "Common errors"
+
+Just type your question or choose an option above! 🚀"""
+        return menu_response, "qa"
+    
+    # Check knowledge base with partial matching
     for keyword, answer in KNOWLEDGE_BASE.items():
         if keyword in query_lower:
             return answer, "qa"
     
-    # Check for common questions
-    if "what is" in query_lower or "simulator" in query_lower:
-        return KNOWLEDGE_BASE["what is"], "qa"
-    elif "how" in query_lower and "use" in query_lower:
-        return KNOWLEDGE_BASE["how to use"], "qa"
-    elif "layer" in query_lower or "visualization" in query_lower:
-        return KNOWLEDGE_BASE["multi-layer"], "qa"
-    elif "export" in query_lower or "download" in query_lower:
-        return KNOWLEDGE_BASE["export"], "qa"
-    elif "trace" in query_lower:
-        return KNOWLEDGE_BASE["trace"], "qa"
-    elif "device" in query_lower:
-        return KNOWLEDGE_BASE["devices"], "qa"
-    elif "protocol" in query_lower:
-        return KNOWLEDGE_BASE["protocols"], "qa"
-    elif "pause" in query_lower or "resume" in query_lower:
-        return KNOWLEDGE_BASE["pause"], "qa"
-    elif "import" in query_lower:
-        return KNOWLEDGE_BASE["import"], "qa"
-    elif "script" in query_lower:
-        return KNOWLEDGE_BASE["script"], "qa"
-    elif "error" in query_lower:
-        return KNOWLEDGE_BASE["error"], "qa"
+    # Enhanced keyword matching for common questions
+    question_keywords = {
+        # General questions
+        "what": KNOWLEDGE_BASE["what is"],
+        "explain": KNOWLEDGE_BASE["what is"],
+        "describe": KNOWLEDGE_BASE["what is"],
+        "tell me": KNOWLEDGE_BASE["what is"],
+        "about": KNOWLEDGE_BASE["what is"],
+        
+        # Usage
+        "use": KNOWLEDGE_BASE["how to use"],
+        "start": KNOWLEDGE_BASE["how to use"],
+        "begin": KNOWLEDGE_BASE["tutorial"],
+        "run": KNOWLEDGE_BASE["how to use"],
+        "execute": KNOWLEDGE_BASE["how to use"],
+        
+        # Features
+        "feature": KNOWLEDGE_BASE["features"],
+        "capability": KNOWLEDGE_BASE["features"],
+        "can": KNOWLEDGE_BASE["features"],
+        "do": KNOWLEDGE_BASE["features"],
+        
+        # Visualization
+        "view": KNOWLEDGE_BASE["visualization"],
+        "see": KNOWLEDGE_BASE["visualization"],
+        "display": KNOWLEDGE_BASE["visualization"],
+        "show": KNOWLEDGE_BASE["visualization"],
+        
+        # Energy
+        "power": KNOWLEDGE_BASE["energy"],
+        "battery": KNOWLEDGE_BASE["energy"],
+        "consumption": KNOWLEDGE_BASE["energy"],
+        
+        # Performance
+        "speed": KNOWLEDGE_BASE["performance"],
+        "fast": KNOWLEDGE_BASE["performance"],
+        "metric": KNOWLEDGE_BASE["performance"],
+        "statistic": KNOWLEDGE_BASE["performance"],
+        
+        # Help
+        "assist": KNOWLEDGE_BASE["help"],
+        "guide": KNOWLEDGE_BASE["help"],
+        "support": KNOWLEDGE_BASE["support"],
+        
+        # Network
+        "connect": KNOWLEDGE_BASE["connection"],
+        "link": KNOWLEDGE_BASE["connection"],
+        "topology": KNOWLEDGE_BASE["network"],
+        
+        # Protocols
+        "communication": KNOWLEDGE_BASE["protocols"],
+        "wireless": KNOWLEDGE_BASE["protocols"],
+        "wired": KNOWLEDGE_BASE["protocols"],
+        
+        # Devices
+        "hardware": KNOWLEDGE_BASE["devices"],
+        "sensor": KNOWLEDGE_BASE["devices"],
+        "actuator": KNOWLEDGE_BASE["devices"],
+        "microcontroller": KNOWLEDGE_BASE["devices"],
+        
+        # Learning
+        "learn": KNOWLEDGE_BASE["tutorial"],
+        "study": KNOWLEDGE_BASE["student"],
+        "teach": KNOWLEDGE_BASE["tutorial"],
+        
+        # Troubleshooting
+        "problem": KNOWLEDGE_BASE["error"],
+        "issue": KNOWLEDGE_BASE["error"],
+        "fix": KNOWLEDGE_BASE["error"],
+        "debug": KNOWLEDGE_BASE["error"],
+    }
     
-    # Default response
-    return "I can help you with IoT simulator scripts and answer questions. Try asking about: smart home networks, industrial IoT, smart city, or how to use specific features like multi-layer visualization or export.", "qa"
+    # Check enhanced keywords
+    for keyword, answer in question_keywords.items():
+        if keyword in query_lower:
+            return answer, "qa"
+    
+    # Default response with more helpful suggestions
+    default_response = """I can help you with the IoT Simulator! Here are some things you can ask:
+
+**About the Simulator:**
+- "What is this simulator?"
+- "What are the features?"
+- "How does it work?"
+
+**Using the Simulator:**
+- "How do I use it?"
+- "How to create a network?"
+- "How to visualize devices?"
+
+**Technical Details:**
+- "What devices are available?"
+- "What protocols are supported?"
+- "How does energy simulation work?"
+
+**Script Generation:**
+- "Create a smart home network"
+- "Generate an industrial IoT script"
+- "Make a simple IoT setup"
+
+**Troubleshooting:**
+- "How to fix common errors?"
+- "Why is my script not working?"
+
+Try asking any of these, or be more specific about what you need help with!"""
+    
+    return default_response, "qa"
 
 @app.route('/chatbot', methods=['POST'])
 def chatbot():
