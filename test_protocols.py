@@ -14,9 +14,9 @@ class TestWiredProtocols(unittest.TestCase):
     def test_i2c_frame_bits(self):
         """Test I2C frame bits calculation"""
         protocol = I2C()
-        # I2C: 1 start bit + 8 data bits + 1 ACK bit per byte
+        # I2C: start + address byte (7-bit addr + R/W) + ACK + data bytes (8 bits + ACK each) + stop
         payload_bytes = 10
-        expected_bits = 1 + (payload_bytes * 8) + (payload_bytes * 1)  # Start + Data + ACK
+        expected_bits = 1 + 9 + payload_bytes * 9 + 1
         result = protocol.frame_bits(payload_bytes)
         self.assertEqual(result, expected_bits)
     

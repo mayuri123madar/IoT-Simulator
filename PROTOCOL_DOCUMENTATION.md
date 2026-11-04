@@ -333,7 +333,7 @@ All protocols implement the following standard interface:
 ### Validation
 
 - ✅ Battery drain is linear with current and time
-- ✅ Battery percentage calculation is accurate
+- ✅ Battery percentage matches hand calculation
 - ✅ Battery death detection works correctly
 - ✅ Energy model tracks all states (TX, RX, idle, sleep)
 
@@ -565,11 +565,11 @@ topology_rec = engine.recommend_topology(num_devices=50, area_size_m2=1000, requ
 
 ## Conclusion
 
-All protocols have been implemented with datasheet-backed formulas and validated through comprehensive testing. The simulator provides accurate modeling of:
+Protocols are implemented from published standards/datasheet formulas and checked against hand-calculated test values (see test_hand_calculations.py). Radio parameters (TX power, sensitivity, path-loss exponent) and some currents are modelling assumptions, not yet verified against datasheets. The simulator provides accurate modeling of:
 - Frame structure and overhead
 - Transmission time (airtime)
 - Energy consumption
 - Packet loss based on distance
 - Retransmission requirements
 
-The energy model accurately tracks battery drain across different device types and power states. The recommendation engine provides intelligent protocol and topology suggestions based on user requirements.
+The energy model tracks battery drain from the simulated state (TX/RX/idle/sleep currents x time). The recommendation runs the event engine per protocol and ranks by simulated network lifetime. Results are only as accurate as the input parameters.

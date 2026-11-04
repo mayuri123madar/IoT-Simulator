@@ -47,6 +47,32 @@
 
 <div id="cy"></div>
 
+<div id="enginePanel" class="status" style="display:none">
+    <h3>Simulation results <small id="engineNote" style="font-weight:normal;color:#666"></small></h3>
+    <div style="margin:8px 0">
+        Replay speed:
+        <select id="speedSelect" onchange="replaySpeed = parseFloat(this.value)">
+            <option value="1">1x (real time)</option><option value="10">10x</option><option value="60" selected>60x (1 min per s)</option>
+            <option value="600">600x</option><option value="3600">3600x (1 h per s)</option><option value="86400">86400x (1 day per s)</option>
+        </select>
+        &nbsp; Position: <input id="replaySlider" type="range" min="0" max="1000" value="0" style="width:260px" oninput="seekReplay(this.value / 1000 * sim.duration_s)">
+        <span id="replayClock"></span>
+    </div>
+    <div id="engineWarnings" style="color:#b35900"></div>
+    <div id="engineSummary"></div>
+    <div id="engineTables" style="overflow-x:auto"></div>
+</div>
+
+<div id="recommendPanel" class="status" style="display:none">
+    <h3>Recommend a protocol (runs the simulation once per option)</h3>
+    <div style="margin:8px 0">
+        Max average latency (ms): <input id="recLatency" type="number" min="0" style="width:90px" placeholder="optional">
+        &nbsp; Min delivery (%): <input id="recDelivery" type="number" min="0" max="100" value="90" style="width:70px">
+        &nbsp; <button onclick="runRecommendation()" id="recBtn">🔍 Recommend</button>
+    </div>
+    <div id="recResult"></div>
+</div>
+
 <div class="status">
     <h3>Simulation Log</h3>
     <div id="simLog" style="height: 150px; overflow-y: auto; background: #f9f9f9; padding: 10px; border: 1px solid #ddd; font-family: monospace; font-size: 12px;"></div>
@@ -54,6 +80,8 @@
 
 <script>
 const data = JSON.parse(localStorage.getItem("simData") || "{}");
+const sim = data.simulation || null;      // results of the event-driven engine (present when the script uses send_interval)
+const engineMode = !!sim;
 let simulationInterval = null;
 let simulationTime = 0;
 let packetCount = 0;
@@ -413,11 +441,12 @@ Object.keys(states).forEach(id => {
 function log(message) {
     const logDiv = document.getElementById("simLog");
     const timestamp = new Date().toLocaleTimeString();
-    logDiv.innerHTML += `[${timestamp}] ${message}\n`;
+    logDiv.appendChild(document.createTextNode(`[${timestamp}] ${message}\n`));   // text, not HTML: ids come from user scripts
     logDiv.scrollTop = logDiv.scrollHeight;
 }
 
 function startSimulation() {
+    if (engineMode) { startReplay(); return; }
     if (isPaused) {
         isPaused = false;
         log("▶️ Simulation resumed");
@@ -496,6 +525,7 @@ function togglePauseResume() {
 }
 
 function resetSimulation() {
+    if (engineMode) { resetReplay(); }
     clearInterval(simulationInterval);
     simulationInterval = null;
     simulationTime = 0;
@@ -529,9 +559,11 @@ function resetSimulation() {
     log("🔄 Simulation reset");
     addTraceEntry('s', 'system', 'system', 'control', 'Simulation reset');
     clearTraceData(); // Clear trace data on reset
+    if (engineMode) { applyVisualizationLayer(visualizationLayer); }
 }
 
 function stepSimulation() {
+    if (engineMode) { advanceReplay(replayTime + replaySpeed); return; }
     simulationTime++;
     document.getElementById("simTime").textContent = simulationTime;
     simulateDataFlow();
@@ -912,6 +944,7 @@ function toggleVisualizationLayer() {
 }
 
 function applyVisualizationLayer(layer) {
+    if (engineMode) { applyEngineLayer(layer); return; }
     // Reset to default styling
     cy.nodes().style('background-color', '#777');
     cy.edges().style('line-color', '#999');
@@ -975,6 +1008,258 @@ function applyVisualizationLayer(layer) {
             });
             break;
     }
+}
+
+
+// ===================== ENGINE MODE: replay of the event-driven simulation =====================
+let replayTime = 0, replayIdx = 0, keyIdx = 0, replayTimer = null, animTimer = null, replaySpeed = 60;
+let deliveredCount = 0, silentReplay = false;
+const deadNodes = new Set();
+const protoPacketType = {WiFi: 'wifi', BLE: 'bluetooth', LoRa: 'lora', Zigbee: 'zigbee', I2C: 'i2c', UART: 'serial', SPI: 'spi'};
+const protoColors = {I2C: '#ff9800', SPI: '#673ab7', UART: '#9c27b0', CAN: '#795548', WiFi: '#2196f3', BLE: '#3b5998',
+                     LoRa: '#e91e63', Zigbee: '#ff9800', MQTT: '#007bff', CoAP: '#009688'};
+
+function esc(s) {
+    return String(s).replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+}
+function fmtDuration(s) {
+    if (s === null || s === undefined) return '–';
+    if (s < 60) return s.toFixed(2) + ' s';
+    if (s < 3600) return (s / 60).toFixed(1) + ' min';
+    if (s < 86400) return (s / 3600).toFixed(1) + ' h';
+    if (s < 86400 * 365) return (s / 86400).toFixed(1) + ' days';
+    return (s / 86400 / 365).toFixed(1) + ' years';
+}
+function num(x, d = 2) { return (x === null || x === undefined) ? '–' : Number(x).toFixed(d); }
+
+function findEdge(a, b) {
+    return cy.edges().filter(e => (e.source().id() === a && e.target().id() === b) ||
+                                  (e.source().id() === b && e.target().id() === a))[0];
+}
+
+function batteryAt(id, t) {
+    let k = 0;
+    for (let i = 0; i < sim.timeline.length; i++) { if (sim.timeline[i].t <= t) k = i; else break; }
+    const v = sim.timeline[k] && sim.timeline[k].battery_pct[id];
+    return v === undefined ? null : v;
+}
+function aliveAt(t) {
+    let alive = sim.timeline.length ? sim.timeline[0].alive : cy.nodes().length;
+    for (const s of sim.timeline) { if (s.t <= t) alive = s.alive; else break; }
+    return alive;
+}
+
+function startReplay() {
+    isPaused = false;
+    document.getElementById("simStatus").textContent = 'Running';
+    log("🚀 Replaying the simulation (" + fmtDuration(sim.duration_s) + " of simulated time)");
+    if (replayTime >= sim.duration_s) resetReplay();
+    if (!replayTimer) {
+        replayTimer = setInterval(() => {
+            if (isPaused) return;
+            if (replayTime >= sim.duration_s) { finishReplay(); return; }
+            advanceReplay(replayTime + replaySpeed * 0.1);
+        }, 100);
+    }
+    if (!animTimer) animTimer = setInterval(() => { if (!isPaused) updatePackets(); }, 50);
+}
+function finishReplay() {
+    clearInterval(replayTimer); replayTimer = null;
+    document.getElementById("simStatus").textContent = 'Finished';
+    log("🏁 Replay finished");
+}
+function resetReplay() {
+    clearInterval(replayTimer); replayTimer = null;
+    clearInterval(animTimer); animTimer = null;
+    replayTime = 0; replayIdx = 0; keyIdx = 0; deliveredCount = 0;
+    deadNodes.clear();
+    activePackets.forEach(p => p.destroy()); activePackets = [];
+    document.getElementById("replaySlider").value = 0;
+    document.getElementById("replayClock").textContent = fmtDuration(0);
+    cy.nodes().forEach(n => { if (!n.data('label0')) n.data('label0', n.data('label')); });
+}
+function seekReplay(t) {
+    // jump to time t: replay silently from the start (no packet animations) so counters and dead nodes are right
+    const wasPaused = isPaused;
+    resetReplay();
+    silentReplay = true;
+    advanceReplay(t);
+    silentReplay = false;
+    isPaused = wasPaused;
+}
+
+function advanceReplay(t) {
+    t = Math.min(t, sim.duration_s);
+    replayTime = t;
+    while (replayIdx < sim.trace.length && sim.trace[replayIdx][0] <= t) { handleTrace(sim.trace[replayIdx]); replayIdx++; }
+    while (keyIdx < sim.key_events.length && sim.key_events[keyIdx][0] <= t) { handleKey(sim.key_events[keyIdx]); keyIdx++; }
+    document.getElementById("simTime").textContent = fmtDuration(t);
+    document.getElementById("replayClock").textContent = fmtDuration(t) + ' / ' + fmtDuration(sim.duration_s);
+    document.getElementById("replaySlider").value = Math.round(t / sim.duration_s * 1000);
+    document.getElementById("packetCount").textContent = deliveredCount;
+    const maxLoad = Math.max(0, ...sim.edges.map(e => e.load_pct));
+    document.getElementById("networkLoad").textContent = maxLoad.toFixed(2);
+    document.getElementById("activeNodes").textContent = aliveAt(t);
+    document.getElementById("totalNodes").textContent = cy.nodes().filter(n => !String(n.id()).startsWith('packet_')).length;
+    applyEngineLayer(visualizationLayer);
+    if (t >= sim.duration_s && replayTimer) finishReplay();
+}
+
+function handleTrace(ev) {
+    const [t, kind, src, dst, info] = ev;
+    if (kind === 'TX') {
+        if (silentReplay || activePackets.length > 60) return;
+        const a = cy.getElementById(src), b = cy.getElementById(dst);
+        if (a.length && b.length) {
+            const proto = (info || '').split(' ')[0];
+            activePackets.push(new DataPacket(a, b, protoPacketType[proto] || 'data'));
+            const e = findEdge(src, dst); if (e) activateEdge(e);
+        }
+    } else if (kind === 'DELIVER') {
+        deliveredCount++;
+    } else if (kind === 'LOSS' || kind === 'DROP') {
+        if (!silentReplay) log((kind === 'LOSS' ? '⚠️ lost ' : '🗑️ dropped ') + src + ' → ' + dst + ' (' + info + ') at ' + fmtDuration(t));
+    }
+}
+function handleKey(ev) {
+    const [t, kind, src, dst, info] = ev;
+    if (kind === 'DEAD') {
+        deadNodes.add(src);
+        if (!silentReplay) log('💀 ' + src + ' ran out of battery at ' + fmtDuration(t));
+    } else if (kind === 'REROUTE') {
+        if (!silentReplay) log('🔀 re-routed at ' + src + ' towards ' + dst + ': ' + info);
+    }
+}
+
+// ----- layers (engine mode) -----
+function applyEngineLayer(layer) {
+    const typeColors = {Sensor: '#2ecc71', Actuator: '#e74c3c', Controller: '#3498db', Gateway: '#f39c12', Cloud: '#9b59b6',
+                        Router: '#1abc9c', Server: '#8e44ad', Arduino: '#3498db', ESP32: '#16a085', RaspberryPi: '#c0392b'};
+    const maxEnergy = Math.max(1e-9, ...Object.values(sim.nodes).map(n => n.energy_mj.total));
+    const maxLoad = Math.max(1e-9, ...sim.edges.map(e => e.load_pct));
+    cy.edges().forEach(e => { e.style('line-color', '#999'); e.style('width', 2); e.style('label', ''); });
+    cy.nodes().forEach(n => {
+        const id = n.id();
+        if (String(id).startsWith('packet_')) return;
+        if (!n.data('label0')) n.data('label0', n.data('label'));
+        const info = sim.nodes[id];
+        let color = typeColors[n.data('type')] || '#777';
+        let label = n.data('label0');
+        const dead = deadNodes.has(id);
+        if (info && info.state === 'off') { color = '#ccc'; label += ' (off)'; }
+        if (layer === 'Protocol' || layer === 'DataFlow') color = '#bbb';
+        if (layer === 'Energy' && info) {
+            const pct = batteryAt(id, replayTime);
+            if (pct !== null) {
+                color = pct < 20 ? '#e74c3c' : (pct < 50 ? '#f39c12' : '#2ecc71');
+                label += ' ' + pct.toFixed(1) + '%';
+            } else {
+                const r = info.energy_mj.total / maxEnergy;
+                color = r > 0.66 ? '#e74c3c' : (r > 0.33 ? '#f39c12' : '#2ecc71');
+                label += ' ' + num(info.energy_mj.total, 0) + ' mJ';
+            }
+        }
+        if (dead) { color = '#000'; label += ' ☠'; }
+        n.style('background-color', color);
+        n.data('label', label);
+    });
+    sim.edges.forEach(ed => {
+        const e = findEdge(ed.source, ed.target);
+        if (!e) return;
+        if (layer === 'Protocol') {
+            e.style('line-color', protoColors[ed.protocol] || '#999');
+            e.style('width', 2 + 4 * Math.min(1, ed.attempts / Math.max(1, ...sim.edges.map(x => x.attempts))));
+            e.style('label', ed.protocol || '');
+        } else if (layer === 'DataFlow') {
+            const r = ed.load_pct / maxLoad;
+            e.style('line-color', ed.loss_pct > 20 ? '#e74c3c' : `rgb(255, ${Math.floor(255 * (1 - r))}, 0)`);
+            e.style('width', 2 + 8 * r);
+            e.style('label', ed.load_pct.toFixed(3) + '% load, ' + ed.loss_pct.toFixed(0) + '% loss');
+        }
+    });
+    cy.style().selector('edge').style({'font-size': 9, 'text-background-color': '#fff', 'text-background-opacity': 0.8}).update();
+}
+
+// ----- results tables -----
+function renderEngineResults() {
+    document.getElementById("enginePanel").style.display = 'block';
+    document.getElementById("engineNote").textContent = '(' + fmtDuration(sim.duration_s) + ' simulated, ' + sim.events_processed + ' events)';
+    document.getElementById("engineWarnings").innerHTML = (sim.warnings || []).map(w => '⚠️ ' + esc(w)).join('<br>');
+    const s = sim.summary;
+    document.getElementById("engineSummary").innerHTML =
+        '<b>Delivery:</b> ' + (s.delivery_ratio === null ? '–' : (s.delivery_ratio * 100).toFixed(1) + '%') +
+        ' &nbsp; <b>Avg latency:</b> ' + num(s.avg_latency_ms, 2) + ' ms' +
+        ' &nbsp; <b>First node death:</b> ' + fmtDuration(s.first_node_death_s) +
+        ' &nbsp; <b>First flow disconnected:</b> ' + fmtDuration(s.first_flow_disconnected_s) +
+        ' &nbsp; <b>All flows disconnected:</b> ' + fmtDuration(s.all_flows_disconnected_s) +
+        ' &nbsp; <b>Total energy:</b> ' + num(s.total_energy_mj, 1) + ' mJ';
+    const th = 'style="text-align:left;padding:2px 8px;border-bottom:1px solid #ccc"';
+    let rows = '';
+    Object.entries(sim.nodes).forEach(([id, n]) => {
+        rows += '<tr><td ' + th + '>' + esc(id) + '</td><td ' + th + '>' + esc(n.type) + '</td><td ' + th + '>' +
+            esc(n.protocol || '–') + (n.protocol_assumed ? ' *' : '') + '</td><td ' + th + '>' + esc(n.state) +
+            '</td><td ' + th + '>' + (n.battery_pct === null ? 'mains' : n.battery_pct.toFixed(2) + '%') +
+            '</td><td ' + th + '>' + num(n.energy_mj.tx, 2) + ' / ' + num(n.energy_mj.rx, 2) + ' / ' + num(n.energy_mj.idle, 1) + ' / ' + num(n.energy_mj.sleep, 1) +
+            '</td><td ' + th + '>' + (n.died_at_s !== null ? 'died ' + fmtDuration(n.died_at_s) : fmtDuration(n.projected_lifetime_s)) +
+            '</td><td ' + th + '>' + n.sent + ' / ' + n.received + ' / ' + n.forwarded +
+            '</td><td ' + th + '>' + esc(JSON.stringify(n.dropped)) + '</td></tr>';
+    });
+    let frows = '';
+    sim.flows.forEach(f => {
+        frows += '<tr><td ' + th + '>' + esc(f.source) + ' → ' + esc(f.sink || 'nearest sink') + '</td><td ' + th + '>every ' + f.interval_s + ' s, ' + f.payload_bytes +
+            ' B</td><td ' + th + '>' + f.generated + ' / ' + f.delivered + ' / ' + f.dropped + '</td><td ' + th + '>' +
+            (f.delivery_ratio === null ? '–' : (f.delivery_ratio * 100).toFixed(1) + '%') + '</td><td ' + th + '>' + num(f.avg_latency_ms, 2) +
+            ' / ' + num(f.max_latency_ms, 2) + '</td><td ' + th + '>' + esc(JSON.stringify(f.drop_reasons)) + '</td></tr>';
+    });
+    document.getElementById("engineTables").innerHTML =
+        '<h4>Nodes</h4><table style="border-collapse:collapse;font-size:12px"><tr><th ' + th + '>Node</th><th ' + th + '>Type</th><th ' + th + '>Protocol</th><th ' + th + '>State</th><th ' + th + '>Battery</th>' +
+        '<th ' + th + '>Energy mJ (tx / rx / idle / sleep)</th><th ' + th + '>Lifetime (projected)</th><th ' + th + '>Packets sent / received / forwarded</th><th ' + th + '>Dropped</th></tr>' + rows + '</table>' +
+        '<div style="font-size:11px;color:#666">* no protocol set in the script, WiFi assumed. Lifetime is extrapolated from the observed drain rate.</div>' +
+        '<h4>Traffic flows</h4><table style="border-collapse:collapse;font-size:12px"><tr><th ' + th + '>Flow</th><th ' + th + '>Traffic</th><th ' + th + '>Generated / delivered / dropped</th><th ' + th + '>Delivery</th><th ' + th + '>Latency ms (avg / max)</th><th ' + th + '>Drop reasons</th></tr>' + frows + '</table>';
+    document.getElementById("recommendPanel").style.display = 'block';
+}
+
+// ----- recommendation -----
+function runRecommendation() {
+    const btn = document.getElementById("recBtn");
+    const out = document.getElementById("recResult");
+    btn.disabled = true; out.textContent = 'Running the simulation for each protocol option…';
+    const lat = document.getElementById("recLatency").value;
+    const del = parseFloat(document.getElementById("recDelivery").value);
+    fetch("/recommend_by_simulation", {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({script: data.script, duration_s: sim.requested_duration_s,
+                              constraints: {max_latency_ms: lat === '' ? null : parseFloat(lat), min_delivery_ratio: isNaN(del) ? 0.9 : del / 100}})
+    }).then(async res => {
+        const j = await res.json();
+        if (!res.ok) { out.textContent = j.error || 'Failed'; return; }
+        const th = 'style="text-align:left;padding:2px 8px;border-bottom:1px solid #ccc"';
+        let html = j.best ? '<p>✅ <b>Best option: ' + esc(j.best) + '</b></p>' : '<p>❌ <b>No option meets the constraints.</b></p>';
+        html += '<table style="border-collapse:collapse;font-size:12px"><tr><th ' + th + '>#</th><th ' + th + '>Option</th><th ' + th + '>Network lifetime</th><th ' + th + '>Avg latency</th><th ' + th + '>Delivery</th><th ' + th + '>Total energy</th><th ' + th + '>Status</th></tr>';
+        j.ranked.forEach((r, i) => {
+            html += '<tr' + (i === 0 ? ' style="background:#e8f8e8"' : '') + '><td ' + th + '>' + (i + 1) + '</td><td ' + th + '>' + esc(r.name) + '</td><td ' + th + '>' + fmtDuration(r.lifetime_s) +
+                '</td><td ' + th + '>' + num(r.avg_latency_ms, 2) + ' ms</td><td ' + th + '>' + (r.delivery_ratio * 100).toFixed(1) + '%</td><td ' + th + '>' + num(r.total_energy_mj, 1) + ' mJ</td><td ' + th + '>meets constraints</td></tr>';
+        });
+        j.excluded.forEach(r => {
+            html += '<tr style="color:#999"><td ' + th + '>–</td><td ' + th + '>' + esc(r.name) + '</td><td ' + th + '>' + fmtDuration(r.lifetime_s) +
+                '</td><td ' + th + '>' + (r.avg_latency_ms === null || r.avg_latency_ms === undefined ? '–' : num(r.avg_latency_ms, 2) + ' ms') + '</td><td ' + th + '>' +
+                (r.delivery_ratio === null || r.delivery_ratio === undefined ? '–' : (r.delivery_ratio * 100).toFixed(1) + '%') + '</td><td ' + th + '>' + num(r.total_energy_mj, 1) + ' mJ</td><td ' + th + '>' + esc((r.fails_because || [r.error]).join('; ')) + '</td></tr>';
+        });
+        html += '</table><div style="font-size:11px;color:#666">' + (j.notes || []).map(esc).join('<br>') + '</div>';
+        out.innerHTML = html;
+    }).catch(() => { out.textContent = 'Server error'; })
+      .finally(() => { btn.disabled = false; });
+}
+
+if (engineMode) {
+    cy.nodes().forEach(n => n.data('label0', n.data('label')));
+    renderEngineResults();
+    applyEngineLayer('Device');
+    document.getElementById("totalNodes").textContent = cy.nodes().length;
+    document.getElementById("replayClock").textContent = fmtDuration(0) + ' / ' + fmtDuration(sim.duration_s);
+    const unitText = document.getElementById("simTime").nextSibling;   // the page appends "s" after the time; fmtDuration already has a unit
+    if (unitText && unitText.nodeType === 3) unitText.textContent = ' | ';
+    log('📈 Event-driven simulation loaded: press Start to replay it');
 }
 
 // Initialize

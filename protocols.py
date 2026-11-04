@@ -1,8 +1,9 @@
 """
 IoT Protocol Implementations with Datasheet-Based Formulas
-All formulas verified against official datasheets and specifications.
+Datasheet-based formulas. Parameter values must be checked against the cited documents.
 """
 
+import math
 from protocol_interface import WiredProtocol, WirelessProtocol, ApplicationProtocol
 
 
@@ -21,7 +22,7 @@ class I2C(WiredProtocol):
         self.start_bits = self.parameters.get('start_bits', 1)
         self.stop_bits = self.parameters.get('stop_bits', 1)
         self.address_bits = self.parameters.get('address_bits', 7)
-        self.tx_current_ma = self.parameters.get('tx_current_ma', 0.5)
+        self.tx_current_ma = self.parameters.get('tx_current_ma', 2.25)
         self.voltage_v = 3.3  # Typical I2C voltage
     
     def frame_bits(self, payload_bytes):
@@ -90,7 +91,7 @@ class SPI(WiredProtocol):
         super().__init__('SPI')
         self.clock = clock_hz
         self.bits_per_byte = self.parameters.get('bits_per_byte', 8)
-        self.tx_current_ma = self.parameters.get('tx_current_ma', 2.0)
+        self.tx_current_ma = self.parameters.get('tx_current_ma', 2.25)
         self.voltage_v = 3.3
     
     def frame_bits(self, payload_bytes):
@@ -144,7 +145,7 @@ class UART(WiredProtocol):
         self.baud_rate = baud_rate
         self.config = config
         self.bits_per_byte = self.parameters.get('bits_per_byte', 10)  # 8N1 = 10 bits
-        self.tx_current_ma = self.parameters.get('tx_current_ma', 1.5)
+        self.tx_current_ma = self.parameters.get('tx_current_ma', 0.3)
         self.voltage_v = 3.3
     
     def frame_bits(self, payload_bytes):
@@ -199,7 +200,12 @@ class CAN(WiredProtocol):
         self.bit_rate = bit_rate
         self.max_data_bytes = self.parameters.get('max_data_bytes', 8)
         self.overhead_bits = self.parameters.get('overhead_bits', 47)  # Standard CAN frame overhead
-        self.tx_current_ma = self.parameters.get('tx_current_ma', 3.0)
+        self.tx_current_ma = self.parameters.get('tx_current_ma', 42.5)
+        # average of dominant and recessive supply current (MCP2551 DC characteristics)
+        if 'dominant_current_ma' in self.parameters:
+            f = self.parameters.get('dominant_fraction', 0.5)
+            self.tx_current_ma = (f * self.parameters['dominant_current_ma']
+                                  + (1 - f) * self.parameters['recessive_current_ma'])
         self.voltage_v = 5.0  # Typical CAN voltage
     
     def frame_bits(self, payload_bytes):
@@ -334,7 +340,8 @@ class WiFi(WirelessProtocol):
     
     def extra_packets(self, payload_bytes):
         """
-        WiFi requires ACK packet
+        WiFi requires ACK packet.
+        NOTE: the ACK time is already inside airtime(); do not add it again.
         Source: IEEE 802.11 Standard, Section 9.3
         """
         return 1  # ACK packet
@@ -363,30 +370,18 @@ class BLE(WirelessProtocol):
     
     def frame_bits(self, payload_bytes):
         """
-        Calculate total bits on the wire
-        Formula: preamble + access address + header + payload + CRC
-        Source: Bluetooth Core Specification 5.0, Section 2.1
+        Total bits on the wire. Payloads larger than max_payload_bytes are split
+        into several packets, each with its own preamble/address/header/CRC.
         """
-        # Limit payload to BLE max
-        payload_bytes = min(payload_bytes, self.max_payload_bytes)
-        
-        bits = self.preamble_bits + self.access_address_bits + self.header_bits
-        bits += (payload_bytes * 8) + self.crc_bits
-        return bits
+        packets = max(1, math.ceil(payload_bytes / self.max_payload_bytes))
+        overhead = self.preamble_bits + self.access_address_bits + self.header_bits + self.crc_bits
+        return packets * overhead + payload_bytes * 8
     
     def airtime(self, payload_bytes):
-        """
-        Calculate transmission time in seconds
-        Formula: bits / PHY rate + inter-frame spacing
-        Source: Bluetooth Core Specification 5.0, Section 2.1
-        """
-        bits = self.frame_bits(payload_bytes)
-        data_time = bits / self.phy_rate_bps
-        
-        # Inter-frame spacing (150 microseconds)
-        ifs_time = 150 / 1000000.0
-        
-        return data_time + ifs_time
+        """bits / PHY rate + 150 us inter-frame spacing after every packet"""
+        packets = max(1, math.ceil(payload_bytes / self.max_payload_bytes))
+        data_time = self.frame_bits(payload_bytes) / self.phy_rate_bps
+        return data_time + packets * (150 / 1000000.0)
     
     def tx_energy(self, payload_bytes):
         """
@@ -511,65 +506,53 @@ class LoRa(WirelessProtocol):
         self.spreading_factor = spreading_factor
         self.coding_rate = coding_rate
         self.preamble_symbols = self.parameters.get('preamble_symbols', 8)
-        self.tx_current_ma = self.parameters.get('tx_current_ma', 120)
-        self.rx_current_ma = self.parameters.get('rx_current_ma', 12)
-        self.sleep_current_ma = self.parameters.get('sleep_current_ma', 0.001)
+        self.tx_current_ma = self.parameters.get('tx_current_ma', 28)
+        self.rx_current_ma = self.parameters.get('rx_current_ma', 9.9)
+        self.sleep_current_ma = self.parameters.get('sleep_current_ma', 0.0002)
         self.voltage_v = self.parameters.get('voltage_v', 3.3)
         self.retry_limit = self.parameters.get('retry_limit', 3)
         self.duty_cycle_percent = self.parameters.get('duty_cycle_percent', 1)
-    
+        # Receiver sensitivity depends on the spreading factor: linear interpolation
+        # between the two datasheet points (SF7, SF12); outside that range it is clamped.
+        pts = self.parameters.get('sensitivity_by_sf')
+        if pts:
+            lo, hi = float(pts['7']), float(pts['12'])
+            sf = min(max(self.spreading_factor, 7), 12)
+            self.sensitivity_dbm = lo + (hi - lo) * (sf - 7) / 5.0
+
     def frame_bits(self, payload_bytes):
-        """
-        LoRa uses symbols, not bits directly
-        This returns the symbol count for payload
-        Source: SX1276 Datasheet Semtech, Section 4.1.1
-        """
-        # LoRa airtime formula uses symbols
-        # This is a placeholder - actual calculation in airtime()
-        return payload_bytes * 8
+        """Payload + 16-bit CRC + 20-bit explicit header (bits carried by the modem)"""
+        crc = 16 if self.parameters.get('crc_enabled', 1) else 0
+        header = 0 if self.parameters.get('implicit_header', 0) else 20
+        return payload_bytes * 8 + crc + header
     
     def airtime(self, payload_bytes):
         """
-        Calculate transmission time using Semtech formula
-        Source: SX1276 Datasheet Semtech, Section 4.1.1
-        Formula:
-        symbol_time = 2^SF / bandwidth
-        preamble_time = (preamble_symbols + 4.25) x symbol_time
-        payload_symbols = 8 + max(ceil((8*PL - 4*SF + 28 + 16*CRC - 20*IH) / (4*(SF - 2*DE))) * (CR + 4), 0)
-        airtime = preamble_time + payload_symbols x symbol_time
+        Time on air (Semtech SX127x formula). Duty-cycle waiting is NOT included
+        here - see min_off_time().
+          Tsym = 2^SF / BW
+          Tpreamble = (n_preamble + 4.25) * Tsym
+          n_payload = 8 + max(ceil((8*PL - 4*SF + 28 + 16*CRC - 20*IH) / (4*(SF - 2*DE))) * (CR + 4), 0)
         """
-        # Symbol time in seconds
-        symbol_time = (2 ** self.spreading_factor) / self.bandwidth_hz
-        
-        # Preamble time
-        preamble_time = (self.preamble_symbols + 4.25) * symbol_time
-        
-        # Payload symbols (simplified formula)
-        pl = payload_bytes
         sf = self.spreading_factor
-        cr = self.coding_rate
-        crc = 1  # CRC enabled
-        ih = 0  # Header enabled
-        de = 0  # Data rate optimization
-        
-        numerator = 8 * pl - 4 * sf + 28 + 16 * crc - 20 * ih
+        symbol_time = (2 ** sf) / self.bandwidth_hz
+        preamble_time = (self.preamble_symbols + 4.25) * symbol_time
+
+        crc = 1 if self.parameters.get('crc_enabled', 1) else 0
+        ih = 1 if self.parameters.get('implicit_header', 0) else 0
+        de = 1 if symbol_time > 0.016 else 0      # low data rate optimisation (SF11/12 @125 kHz)
+
+        numerator = 8 * payload_bytes - 4 * sf + 28 + 16 * crc - 20 * ih
         denominator = 4 * (sf - 2 * de)
-        
-        if denominator > 0:
-            payload_symbols = 8 + max((numerator / denominator) * (cr + 4), 0)
-        else:
-            payload_symbols = 8 + pl * 2  # Fallback
-        
-        payload_time = payload_symbols * symbol_time
-        
-        total_airtime = preamble_time + payload_time
-        
-        # Apply duty cycle limit (1% for EU868)
-        if self.duty_cycle_percent > 0:
-            min_interval = (total_airtime / self.duty_cycle_percent) * 100
-            total_airtime += min_interval
-        
-        return total_airtime
+        payload_symbols = 8 + max(math.ceil(numerator / denominator) * (self.coding_rate + 4), 0)
+
+        return preamble_time + payload_symbols * symbol_time
+
+    def min_off_time(self, payload_bytes):
+        """Time the node must stay silent after a packet to respect the duty cycle (spend it at SLEEP current)"""
+        if self.duty_cycle_percent <= 0:
+            return 0.0
+        return self.airtime(payload_bytes) * (100.0 / self.duty_cycle_percent - 1.0)
     
     def tx_energy(self, payload_bytes):
         """
@@ -628,44 +611,23 @@ class MQTT(ApplicationProtocol):
         total_bytes += payload_bytes + self.tcp_ip_overhead_bytes
         return total_bytes * 8
     
+    def _packet_sizes(self, payload_bytes):
+        """Bytes sent for each packet of the QoS exchange (including TCP/IP overhead)"""
+        publish = self.fixed_header_bytes + self.topic_length_bytes + payload_bytes + self.tcp_ip_overhead_bytes
+        if self.qos > 0:
+            publish += 2                               # packet identifier
+        ack = 4 + self.tcp_ip_overhead_bytes           # PUBACK / PUBREC / PUBREL / PUBCOMP = 4 bytes
+        return {0: [publish], 1: [publish, ack], 2: [publish, ack, ack, ack]}.get(self.qos, [publish])
+
     def airtime(self, payload_bytes):
-        """
-        Calculate transmission time using underlying protocol
-        Energy and latency = sum of all packets based on QoS
-        Source: MQTT 3.1.1 Specification, Section 4.3
-        """
-        # QoS 0: 1 packet (PUBLISH)
-        # QoS 1: 2 packets (PUBLISH + PUBACK)
-        # QoS 2: 4 packets (PUBLISH + PUBREC + PUBREL + PUBCOMP)
-        packet_count = {0: 1, 1: 2, 2: 4}.get(self.qos, 1)
-        
-        total_airtime = 0
-        for _ in range(packet_count):
-            total_airtime += self.underlying_protocol.airtime(payload_bytes)
-        
-        return total_airtime
+        """Sum of the underlying link's airtime for every packet of the QoS exchange"""
+        return sum(self.underlying_protocol.airtime(b) for b in self._packet_sizes(payload_bytes))
     
     def tx_energy(self, payload_bytes):
-        """
-        Calculate transmission energy using underlying protocol
-        Sum of energy for all packets based on QoS
-        """
-        packet_count = {0: 1, 1: 2, 2: 4}.get(self.qos, 1)
-        total_energy = 0
-        for _ in range(packet_count):
-            total_energy += self.underlying_protocol.tx_energy(payload_bytes)
-        return total_energy
+        return sum(self.underlying_protocol.tx_energy(b) for b in self._packet_sizes(payload_bytes))
     
     def rx_energy(self, payload_bytes):
-        """
-        Calculate reception energy using underlying protocol
-        Sum of energy for all packets based on QoS
-        """
-        packet_count = {0: 1, 1: 2, 2: 4}.get(self.qos, 1)
-        total_energy = 0
-        for _ in range(packet_count):
-            total_energy += self.underlying_protocol.rx_energy(payload_bytes)
-        return total_energy
+        return sum(self.underlying_protocol.rx_energy(b) for b in self._packet_sizes(payload_bytes))
     
     def loss_probability(self, distance_m):
         """Use underlying protocol's loss model"""
@@ -713,68 +675,26 @@ class CoAP(ApplicationProtocol):
         total_bytes += payload_bytes + self.udp_ip_overhead_bytes
         return total_bytes * 8
     
+    def _packet_sizes(self, payload_bytes):
+        """Bytes for one exchange without loss: message (+ empty ACK if confirmable)"""
+        msg = self.header_bytes + self.token_bytes + payload_bytes + self.udp_ip_overhead_bytes
+        ack = self.header_bytes + self.udp_ip_overhead_bytes
+        return [msg, ack] if self.confirmable else [msg]
+
     def airtime(self, payload_bytes):
-        """
-        Calculate transmission time using underlying protocol
-        Confirmable messages require ACK and retransmission
-        Source: RFC 7252, Section 4.2
-        """
-        if self.confirmable:
-            # Confirmable: CON + ACK (with retransmissions)
-            packet_count = 2  # CON + ACK
-            # Add retransmissions
-            packet_count += self.max_retransmit
-        else:
-            # Non-confirmable: just CON
-            packet_count = 1
-        
-        total_airtime = 0
-        for _ in range(packet_count):
-            total_airtime += self.underlying_protocol.airtime(payload_bytes)
-        
-        return total_airtime
+        """No-loss exchange. Retransmissions (max_retransmit, ack_timeout) are added by the engine when a packet is lost."""
+        return sum(self.underlying_protocol.airtime(b) for b in self._packet_sizes(payload_bytes))
     
     def tx_energy(self, payload_bytes):
-        """
-        Calculate transmission energy using underlying protocol
-        Sum of energy for all packets
-        """
-        if self.confirmable:
-            packet_count = 2 + self.max_retransmit
-        else:
-            packet_count = 1
-        
-        total_energy = 0
-        for _ in range(packet_count):
-            total_energy += self.underlying_protocol.tx_energy(payload_bytes)
-        return total_energy
+        return sum(self.underlying_protocol.tx_energy(b) for b in self._packet_sizes(payload_bytes))
     
     def rx_energy(self, payload_bytes):
-        """
-        Calculate reception energy using underlying protocol
-        Sum of energy for all packets
-        """
-        if self.confirmable:
-            packet_count = 2 + self.max_retransmit
-        else:
-            packet_count = 1
-        
-        total_energy = 0
-        for _ in range(packet_count):
-            total_energy += self.underlying_protocol.rx_energy(payload_bytes)
-        return total_energy
+        return sum(self.underlying_protocol.rx_energy(b) for b in self._packet_sizes(payload_bytes))
     
     def loss_probability(self, distance_m):
         """Use underlying protocol's loss model"""
         return self.underlying_protocol.loss_probability(distance_m)
     
     def extra_packets(self, payload_bytes):
-        """
-        Extra packets based on confirmable flag
-        Confirmable: 1 extra (ACK) + retransmissions
-        Non-confirmable: 0 extra
-        Source: RFC 7252, Section 4.2
-        """
-        if self.confirmable:
-            return 1 + self.max_retransmit
-        return 0
+        """Confirmable: 1 ACK. Retransmissions are not counted here (they depend on loss)."""
+        return 1 if self.confirmable else 0

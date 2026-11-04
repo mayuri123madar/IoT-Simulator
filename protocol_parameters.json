@@ -8,15 +8,15 @@
       "start_bits": 1,
       "stop_bits": 1,
       "address_bits": 7,
-      "tx_current_ma": 0.5,
-      "source": "I2C Specification NXP UM10204, Section 3.1"
+      "tx_current_ma": 2.25,
+      "source": "ATmega328P Atmel datasheet, Typical Characteristics (active supply current, 16 MHz, 5 V): read as 2-2.5 mA, midpoint used. TODO: add page number"
     },
     "SPI": {
       "type": "wired",
       "clock_max": 10000000,
       "bits_per_byte": 8,
-      "tx_current_ma": 2.0,
-      "source": "SPI Specification Motorola, Section 2.1"
+      "tx_current_ma": 2.25,
+      "source": "ATmega328P Atmel datasheet, Typical Characteristics (active supply current, 16 MHz, 5 V): read as 2-2.5 mA, midpoint used. TODO: add page number"
     },
     "UART": {
       "type": "wired",
@@ -25,16 +25,19 @@
       "parity": "none",
       "stop_bits": 1,
       "bits_per_byte": 10,
-      "tx_current_ma": 1.5,
-      "source": "UART 16550 Datasheet, Section 3.2"
+      "tx_current_ma": 0.3,
+      "source": "MAX3232 TI SLLS410, Section 6.5 Electrical Characteristics (ICC no load, typ 0.3 mA)"
     },
     "CAN": {
       "type": "wired",
       "bit_rate": 1000000,
       "max_data_bytes": 8,
       "overhead_bits": 47,
-      "tx_current_ma": 3.0,
-      "source": "CAN 2.0 Specification Bosch, Section 4.1"
+      "tx_current_ma": 42.5,
+      "source": "MCP2551 Microchip DS21667F, Section 2.2 DC Characteristics, p.9 (IDD max: dominant 75 mA, recessive 10 mA). tx_current_ma = 0.5*75 + 0.5*10 (assumes half the bits are dominant)",
+      "dominant_current_ma": 75,
+      "recessive_current_ma": 10,
+      "dominant_fraction": 0.5
     },
     "WiFi": {
       "type": "wireless",
@@ -43,13 +46,18 @@
       "preamble_us": 16,
       "sifs_us": 10,
       "difs_us": 34,
-      "tx_current_ma": 240,
-      "rx_current_ma": 70,
-      "idle_current_ma": 15,
+      "tx_current_ma": 190,
+      "rx_current_ma": 112,
+      "idle_current_ma": 35,
       "sleep_current_ma": 0.01,
       "voltage_v": 3.3,
       "retry_limit": 7,
-      "source": "ESP32 Datasheet Espressif, Section 2.4"
+      "source": "ESP32-WROOM-32E datasheet Espressif, pp.29,31: TX 54 Mbps 190 mA, RX 112 mA, TX power 15 dBm, sensitivity -75 dBm; deep-sleep 10 uA (sleep); idle = modem-sleep midpoint of 20-50 mA (assumption)",
+      "tx_power_dbm": 15,
+      "sensitivity_dbm": -75,
+      "path_loss_exponent": 3.0,
+      "reference_loss_db": 40.0,
+      "path_loss_note": "Exponent 3.0: Rappaport Table 3.2 p.104 (urban 2.7-3.5, indoor 3 chosen); reference loss at 1 m from free space at the carrier frequency (40 dB at 2.4 GHz, 31 dB at 868 MHz)"
     },
     "BLE": {
       "type": "wireless",
@@ -59,12 +67,17 @@
       "header_bits": 8,
       "crc_bits": 24,
       "max_payload_bytes": 20,
-      "tx_current_ma": 15,
-      "rx_current_ma": 13,
-      "sleep_current_ma": 0.01,
+      "tx_current_ma": 5.3,
+      "rx_current_ma": 5.4,
+      "sleep_current_ma": 0.0003,
       "voltage_v": 3.3,
       "retry_limit": 3,
-      "source": "nRF52832 Datasheet Nordic, Section 6.1"
+      "source": "nRF52832 Product Specification Nordic: TX 0 dBm 5.3 mA and RX 1 Mbps 5.4 mA (DC/DC mode; LDO mode not listed), sensitivity -96 dBm, System-OFF 0.3 uA. Page: add",
+      "tx_power_dbm": 0,
+      "sensitivity_dbm": -96,
+      "path_loss_exponent": 3.0,
+      "reference_loss_db": 40.0,
+      "path_loss_note": "Exponent 3.0: Rappaport Table 3.2 p.104 (urban 2.7-3.5, indoor 3 chosen); reference loss at 1 m from free space at the carrier frequency (40 dB at 2.4 GHz, 31 dB at 868 MHz)"
     },
     "Zigbee": {
       "type": "wireless",
@@ -72,12 +85,18 @@
       "phy_header_bits": 6,
       "mac_header_bits": 104,
       "max_frame_bytes": 127,
-      "tx_current_ma": 25,
-      "rx_current_ma": 20,
-      "sleep_current_ma": 0.001,
+      "tx_current_ma": 17.4,
+      "rx_current_ma": 18.8,
+      "sleep_current_ma": 0.02,
       "voltage_v": 3.3,
       "retry_limit": 4,
-      "source": "IEEE 802.15.4 Standard, Section 6.2"
+      "source": "CC2420 datasheet TI SWRS041c pp.13-14: TX 0 dBm 17.4 mA, RX 18.8 mA, sensitivity -95 dBm typ, power-down 20 uA, idle 426 uA. PHY rate/frame format: IEEE 802.15.4",
+      "tx_power_dbm": 0,
+      "sensitivity_dbm": -95,
+      "path_loss_exponent": 3.0,
+      "reference_loss_db": 40.0,
+      "idle_current_ma": 0.426,
+      "path_loss_note": "Exponent 3.0: Rappaport Table 3.2 p.104 (urban 2.7-3.5, indoor 3 chosen); reference loss at 1 m from free space at the carrier frequency (40 dB at 2.4 GHz, 31 dB at 868 MHz)"
     },
     "LoRa": {
       "type": "wireless",
@@ -85,13 +104,24 @@
       "spreading_factor": 7,
       "coding_rate": 1,
       "preamble_symbols": 8,
-      "tx_current_ma": 120,
-      "rx_current_ma": 12,
-      "sleep_current_ma": 0.001,
+      "tx_current_ma": 28,
+      "rx_current_ma": 9.9,
+      "sleep_current_ma": 0.0002,
       "voltage_v": 3.3,
       "retry_limit": 3,
       "duty_cycle_percent": 1,
-      "source": "SX1276 Datasheet Semtech, Section 4.1.1"
+      "source": "SX1276 datasheet Semtech pp.13-14: RFO +14 dBm TX 28 mA (interpolated from the +13 dBm entry), +20 dBm PA_BOOST 120 mA (not used), RX 9.9 mA, sleep 0.2 uA, sensitivity SF7 -123 dBm and SF12 -137 dBm at 125 kHz; SF8-SF11 linearly interpolated (assumption)",
+      "tx_power_dbm": 14,
+      "sensitivity_dbm": -123,
+      "path_loss_exponent": 3.0,
+      "reference_loss_db": 31.0,
+      "crc_enabled": 1,
+      "implicit_header": 0,
+      "sensitivity_by_sf": {
+        "7": -123,
+        "12": -137
+      },
+      "path_loss_note": "Exponent 3.0: Rappaport Table 3.2 p.104 (urban 2.7-3.5, indoor 3 chosen); reference loss at 1 m from free space at the carrier frequency (40 dB at 2.4 GHz, 31 dB at 868 MHz)"
     },
     "MQTT": {
       "type": "application",
@@ -112,33 +142,208 @@
     }
   },
   "device_parameters": {
+    "Arduino": {
+      "memory_kb": 2,
+      "cpu_mhz": 16,
+      "power_v": 5,
+      "source": "ATmega328P Atmel datasheet (Arduino UNO: 2 KB SRAM, 16 MHz, 5 V)",
+      "source_status": "datasheet-based, verify page"
+    },
     "ESP32": {
       "memory_kb": 520,
       "cpu_mhz": 240,
       "power_v": 3.3,
-      "battery_mah": 0,
-      "source": "ESP32 Datasheet Espressif, Section 2"
+      "source": "ESP32 Datasheet Espressif (520 KB SRAM, 240 MHz, 3.3 V)",
+      "source_status": "datasheet-based, verify page"
     },
-    "Arduino_UNO": {
+    "STM32": {
+      "memory_kb": 20,
+      "cpu_mhz": 72,
+      "power_v": 3.3,
+      "source": "STM32F103C8 datasheet ST (20 KB SRAM, 72 MHz, 3.3 V) - assumed part",
+      "source_status": "datasheet-based, verify page"
+    },
+    "PIC": {
       "memory_kb": 2,
-      "cpu_mhz": 16,
+      "cpu_mhz": 48,
       "power_v": 5,
-      "battery_mah": 0,
-      "source": "ATmega328P Datasheet Atmel, Section 28"
+      "source": "PIC18F4550 datasheet Microchip (2 KB RAM, 48 MHz, 5 V) - assumed part",
+      "source_status": "datasheet-based, verify page"
     },
-    "nRF52832": {
+    "RaspberryPi": {
+      "memory_kb": 4194304,
+      "cpu_mhz": 1500,
+      "power_v": 5,
+      "source": "Raspberry Pi 4 Model B 4 GB (4 GB RAM, 1.5 GHz, 5 V) - assumed model",
+      "source_status": "datasheet-based, verify page"
+    },
+    "BeagleBone": {
+      "memory_kb": 524288,
+      "cpu_mhz": 1000,
+      "power_v": 5,
+      "source": "BeagleBone Black (512 MB RAM, 1 GHz, 5 V)",
+      "source_status": "datasheet-based, verify page"
+    },
+    "JetsonNano": {
+      "memory_kb": 4194304,
+      "cpu_mhz": 1430,
+      "power_v": 5,
+      "source": "NVIDIA Jetson Nano 4 GB (4 GB RAM, 1.43 GHz, 5 V)",
+      "source_status": "datasheet-based, verify page"
+    },
+    "Sensor": {
       "memory_kb": 64,
       "cpu_mhz": 64,
       "power_v": 3.3,
-      "battery_mah": 0,
-      "source": "nRF52832 Datasheet Nordic, Section 6"
+      "source": "nRF52832-class MCU (64 KB RAM, 64 MHz, 3.3 V) assumed for this generic device",
+      "source_status": "ASSUMPTION (generic class)"
     },
-    "SX1276": {
+    "Actuator": {
+      "memory_kb": 64,
+      "cpu_mhz": 64,
+      "power_v": 3.3,
+      "source": "nRF52832-class MCU (64 KB RAM, 64 MHz, 3.3 V) assumed for this generic device",
+      "source_status": "ASSUMPTION (generic class)"
+    },
+    "LED": {
+      "memory_kb": 64,
+      "cpu_mhz": 64,
+      "power_v": 3.3,
+      "source": "nRF52832-class MCU (64 KB RAM, 64 MHz, 3.3 V) assumed for this generic device",
+      "source_status": "ASSUMPTION (generic class)"
+    },
+    "Motor": {
+      "memory_kb": 64,
+      "cpu_mhz": 64,
+      "power_v": 3.3,
+      "source": "nRF52832-class MCU (64 KB RAM, 64 MHz, 3.3 V) assumed for this generic device",
+      "source_status": "ASSUMPTION (generic class)"
+    },
+    "Display": {
+      "memory_kb": 64,
+      "cpu_mhz": 64,
+      "power_v": 3.3,
+      "source": "nRF52832-class MCU (64 KB RAM, 64 MHz, 3.3 V) assumed for this generic device",
+      "source_status": "ASSUMPTION (generic class)"
+    },
+    "Gateway": {
+      "memory_kb": 520,
+      "cpu_mhz": 240,
+      "power_v": 3.3,
+      "source": "ESP32-class (520 KB RAM, 240 MHz, 3.3 V) assumed for this generic device",
+      "source_status": "ASSUMPTION (generic class)"
+    },
+    "Router": {
+      "memory_kb": 520,
+      "cpu_mhz": 240,
+      "power_v": 3.3,
+      "source": "ESP32-class (520 KB RAM, 240 MHz, 3.3 V) assumed for this generic device",
+      "source_status": "ASSUMPTION (generic class)"
+    },
+    "Switch": {
+      "memory_kb": 520,
+      "cpu_mhz": 240,
+      "power_v": 3.3,
+      "source": "ESP32-class (520 KB RAM, 240 MHz, 3.3 V) assumed for this generic device",
+      "source_status": "ASSUMPTION (generic class)"
+    },
+    "Camera": {
+      "memory_kb": 520,
+      "cpu_mhz": 240,
+      "power_v": 3.3,
+      "source": "ESP32-class (520 KB RAM, 240 MHz, 3.3 V) assumed for this generic device",
+      "source_status": "ASSUMPTION (generic class)"
+    },
+    "Server": {
+      "memory_kb": 0,
+      "cpu_mhz": 0,
+      "power_v": 5,
+      "source": "Mains/cloud-powered, memory treated as unlimited (0 = no buffer limit)",
+      "source_status": "ASSUMPTION (generic class)"
+    },
+    "Cloud": {
+      "memory_kb": 0,
+      "cpu_mhz": 0,
+      "power_v": 5,
+      "source": "Mains/cloud-powered, memory treated as unlimited (0 = no buffer limit)",
+      "source_status": "ASSUMPTION (generic class)"
+    },
+    "Mobile": {
+      "memory_kb": 0,
+      "cpu_mhz": 0,
+      "power_v": 3.7,
+      "source": "Phone-class device, memory treated as unlimited, 3.7 V Li-ion nominal",
+      "source_status": "ASSUMPTION (generic class)"
+    },
+    "WiFi": {
       "memory_kb": 0,
       "cpu_mhz": 0,
       "power_v": 3.3,
-      "battery_mah": 0,
-      "source": "SX1276 Datasheet Semtech, Section 1"
+      "source": "Radio module device; memory not modelled (0 = unlimited), 3.3 V",
+      "source_status": "ASSUMPTION (generic class)"
+    },
+    "Bluetooth": {
+      "memory_kb": 0,
+      "cpu_mhz": 0,
+      "power_v": 3.3,
+      "source": "Radio module device; memory not modelled (0 = unlimited), 3.3 V",
+      "source_status": "ASSUMPTION (generic class)"
+    },
+    "LoRa": {
+      "memory_kb": 0,
+      "cpu_mhz": 0,
+      "power_v": 3.3,
+      "source": "Radio module device; memory not modelled (0 = unlimited), 3.3 V",
+      "source_status": "ASSUMPTION (generic class)"
+    },
+    "Zigbee": {
+      "memory_kb": 0,
+      "cpu_mhz": 0,
+      "power_v": 3.3,
+      "source": "Radio module device; memory not modelled (0 = unlimited), 3.3 V",
+      "source_status": "ASSUMPTION (generic class)"
+    },
+    "Battery": {
+      "memory_kb": 0,
+      "cpu_mhz": 0,
+      "power_v": 3.3,
+      "source": "Power component, no memory",
+      "source_status": "ASSUMPTION (generic class)"
+    },
+    "PowerSupply": {
+      "memory_kb": 0,
+      "cpu_mhz": 0,
+      "power_v": 3.3,
+      "source": "Power component, no memory",
+      "source_status": "ASSUMPTION (generic class)"
+    },
+    "SolarPanel": {
+      "memory_kb": 0,
+      "cpu_mhz": 0,
+      "power_v": 3.3,
+      "source": "Power component, no memory",
+      "source_status": "ASSUMPTION (generic class)"
+    },
+    "SDCard": {
+      "memory_kb": 0,
+      "cpu_mhz": 0,
+      "power_v": 3.3,
+      "source": "Storage component, no send buffer",
+      "source_status": "ASSUMPTION (generic class)"
+    },
+    "EEPROM": {
+      "memory_kb": 0,
+      "cpu_mhz": 0,
+      "power_v": 3.3,
+      "source": "Storage component, no send buffer",
+      "source_status": "ASSUMPTION (generic class)"
+    },
+    "FlashMemory": {
+      "memory_kb": 0,
+      "cpu_mhz": 0,
+      "power_v": 3.3,
+      "source": "Storage component, no send buffer",
+      "source_status": "ASSUMPTION (generic class)"
     }
   }
 }

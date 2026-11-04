@@ -18,6 +18,7 @@
 <br><br>
 
 <button onclick="validateScript()">Validate</button>
+<input id="durationInput" type="number" min="1" placeholder="Duration in seconds (default 3600)" style="width:230px; padding:6px;">
 <button onclick="runSimulation()">Run Simulation</button>
 <button onclick="loadExample()">Load Example</button>
 <button onclick="saveNetwork()"> Save Network</button>
@@ -55,13 +56,20 @@ const editor = CodeMirror.fromTextArea(document.getElementById('script'), {
     lineWrapping: true
 });
 
+function requestBody(script) {
+    const body = {script};
+    const d = parseFloat(document.getElementById("durationInput").value);
+    if (d > 0) body.duration_s = d;      // a network.set_duration(...) call in the script wins over this
+    return body;
+}
+
 function validateScript() {
     const script = editor.getValue();
 
     fetch("/simulate", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({script})
+        body: JSON.stringify(requestBody(script))
     })
     .then(async res => {
         if (!res.ok) {
@@ -80,7 +88,7 @@ function runSimulation() {
     fetch("/simulate", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({script})
+        body: JSON.stringify(requestBody(script))
     })
     .then(async res => {
         if (!res.ok) {

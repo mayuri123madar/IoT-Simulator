@@ -199,8 +199,7 @@ When the chatbot generates a script, you can click "Insert Script" to automatica
 ## 🎯 Recommendation
 
 **For Development/Testing**: Use rule-based mode (free, no setup)
-**For Production/Demos**: Use OpenAI mode (full capabilities, impressive demos)
-**For Patent Presentation**: Use OpenAI mode (shows advanced AI integration)
+**For Demos**: Use OpenAI mode (set OPENAI_API_KEY; optional OPENAI_MODEL)
 
 ---
 

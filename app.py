@@ -8,7 +8,7 @@ from datetime import datetime
 import re
 
 # Import new protocol system
-from protocols import I2C, SPI, UART, CAN, WiFi, BLE, Zigbee, LoRa, MQTT, CoAP
+import protocols as _proto   # protocol classes; app.py later defines device classes named WiFi/LoRa/Zigbee, so use _proto.X for protocols
 from energy_model import EnergyModel
 from recommendation_engine import RecommendationEngine
 
@@ -22,18 +22,7 @@ def create_protocol(protocol_name, **kwargs):
     Returns:
         Protocol instance
     """
-    protocol_map = {
-        'I2C': I2C,
-        'SPI': SPI,
-        'UART': UART,
-        'CAN': CAN,
-        'WiFi': WiFi,
-        'BLE': BLE,
-        'Zigbee': Zigbee,
-        'LoRa': LoRa,
-        'MQTT': MQTT,
-        'CoAP': CoAP
-    }
+    protocol_map = {name: getattr(_proto, name) for name in ('I2C', 'SPI', 'UART', 'CAN', 'WiFi', 'BLE', 'Zigbee', 'LoRa', 'MQTT', 'CoAP')}
     
     protocol_class = protocol_map.get(protocol_name)
     if protocol_class:
@@ -62,6 +51,22 @@ TRACE_DIR = "trace_files"
 if not os.path.exists(TRACE_DIR):
     os.makedirs(TRACE_DIR)
 
+def clean_name(name, default="unnamed"):
+    """Make a user-supplied name safe to use inside a filename"""
+    name = re.sub(r'[^\w\- ]', '_', str(name)).strip()[:50]
+    return name or default
+
+def safe_join(base_dir, filename):
+    """Join base_dir + filename; return None if the result would leave base_dir"""
+    name = str(filename)
+    if not name or name != os.path.basename(name) or name in ('.', '..') or '\x00' in name or '\\' in name:
+        return None
+    base = os.path.realpath(base_dir)
+    full = os.path.realpath(os.path.join(base, name))
+    if os.path.dirname(full) != base:
+        return None
+    return full
+
 # ---------- IOT CLASSES FOR PYTHON SCRIPTS ----------
 class IoTNetwork:
     def __init__(self):
@@ -69,18 +74,42 @@ class IoTNetwork:
         self.edges = []
         self.states = {}
         self.dead_nodes = set()  # Track dead nodes for rerouting
+        self.devices = {}        # id -> device object (used by the simulation engine)
+        self.edge_attrs = {}     # (source, target) -> {'distance_m': ...}
+        self.flows = []          # traffic flows added with device.send_interval(...)
+        self.duration_s = None   # simulated time; set with network.set_duration(...)
     
     def add_node(self, node_obj):
         self.nodes[node_obj.id] = node_obj.type
+        self.devices[node_obj.id] = node_obj
         if hasattr(node_obj, 'state'):
             self.states[node_obj.id] = node_obj.state
     
-    def connect_nodes(self, source_obj, target_obj):
+    def connect_nodes(self, source_obj, target_obj, distance_m=10.0):
         if source_obj.id not in self.nodes:
             raise ValueError(f"Source node '{source_obj.id}' does not exist")
         if target_obj.id not in self.nodes:
             raise ValueError(f"Target node '{target_obj.id}' does not exist")
+        if distance_m <= 0:
+            raise ValueError("distance_m must be positive")
         self.edges.append((source_obj.id, target_obj.id))
+        self.edge_attrs[(source_obj.id, target_obj.id)] = {'distance_m': float(distance_m)}
+
+    def edge_distance(self, a, b):
+        attrs = self.edge_attrs.get((a, b)) or self.edge_attrs.get((b, a)) or {}
+        return attrs.get('distance_m', 10.0)
+
+    def set_duration(self, seconds):
+        """Simulated time in seconds (e.g. network.set_duration(86400) for one day)"""
+        if seconds <= 0:
+            raise ValueError("duration must be positive")
+        self.duration_s = float(seconds)
+
+    def add_flow(self, source_id, sink_id, interval_s, payload_bytes):
+        if interval_s <= 0:
+            raise ValueError("interval must be positive")
+        self.flows.append({'source': source_id, 'sink': sink_id, 'interval': float(interval_s),
+                           'payload': int(payload_bytes)})
     
     def mark_node_dead(self, node_id):
         """Mark a node as dead (battery depleted)"""
@@ -164,11 +193,13 @@ recommendation_engine = RecommendationEngine()
 
 # Base IoT Device Class
 class IoTDevice:
-    def __init__(self, device_id, device_type, network_ref=None, protocol=None, battery_mah=0):
+    def __init__(self, device_id, device_type, network_ref=None, protocol=None, battery_mah=0, memory_kb=None):
         self.id = device_id
         self.type = device_type
         self.state = "off"
         self.protocol = protocol
+        self.always_on = None        # None = decide from the device type (gateways/servers stay awake)
+        self.memory_kb = memory_kb   # None = use the value from protocol_parameters.json (if any)
         # Use provided network or global network
         if network_ref:
             self.network = network_ref
@@ -191,9 +222,9 @@ class IoTDevice:
         if self.network:
             self.network.states[self.id] = "off"
     
-    def connect(self, other_device):
+    def connect(self, other_device, distance_m=10.0):
         if self.network:
-            self.network.connect_nodes(self, other_device)
+            self.network.connect_nodes(self, other_device, distance_m)
         else:
             raise ValueError("No network available for connection")
     
@@ -209,26 +240,35 @@ class IoTDevice:
     def send_data(self, data):
         """Simulate sending data from device using protocol"""
         if self.protocol:
-            # Calculate energy and latency using protocol
             data_size = len(str(data))  # Simplified data size
             airtime = self.protocol.airtime(data_size)
-            tx_energy = self.protocol.tx_energy(data_size)
-            
-            # Add to energy model
-            self.energy_model.add_tx_energy(airtime)
+            # ONE energy calculation: the radio's TX current comes from the protocol,
+            # the supply voltage and battery from the device's energy model.
+            link = getattr(self.protocol, 'underlying_protocol', None) or self.protocol
+            energy_mj = self.energy_model.add_tx_energy(airtime, current_ma=getattr(link, 'tx_current_ma', None))
             
             return {
                 "device_id": self.id, 
                 "data": data, 
                 "sent": True,
                 "airtime_s": airtime,
-                "energy_mj": tx_energy
+                "energy_mj": energy_mj
             }
         return {"device_id": self.id, "data": data, "sent": True}
     
     def set_protocol(self, protocol):
         """Set the protocol for this device"""
         self.protocol = protocol
+
+    def set_always_on(self, value=True):
+        """True: the device stays awake (idle current). False: it sleeps between transmissions."""
+        self.always_on = bool(value)
+
+    def send_interval(self, interval_s, payload_bytes=20, to=None):
+        """Send `payload_bytes` every `interval_s` seconds to device `to` (default: nearest Gateway/Server/Cloud)"""
+        if not self.network:
+            raise ValueError("No network available")
+        self.network.add_flow(self.id, to.id if to is not None else None, interval_s, payload_bytes)
 
 # Specific IoT Device Classes
 class Sensor(IoTDevice):
@@ -356,117 +396,166 @@ class FlashMemory(IoTDevice):
 # Global network instance - created AFTER all classes
 network = IoTNetwork()
 
-# ---------- VALIDATION ----------
-def validate_python_script(script: str):
+# ---------- SANDBOX (static check + separate process) ----------
+import multiprocessing
+from engine import run_simulation
+
+SCRIPT_TIMEOUT_S = 5
+DEFAULT_DURATION_S = 3600
+MAX_DURATION_S = 10 * 365 * 24 * 3600
+SCRIPT_MEMORY_BYTES = 768 * 1024 * 1024
+MAX_PRINT_CHARS = 20000
+
+# Names a script may never use
+DENIED_NAMES = {
+    'eval', 'exec', 'compile', 'open', 'input', 'breakpoint', 'getattr', 'setattr', 'delattr',
+    'globals', 'locals', 'vars', 'dir', 'type', 'object', 'super', 'memoryview', 'bytearray',
+    'classmethod', 'staticmethod', 'property',
+}
+# Attributes that give access to frames / globals / code objects (no underscores, so the "__" rule misses them)
+DENIED_ATTRS = {
+    'gi_frame', 'gi_code', 'gi_yieldfrom', 'cr_frame', 'cr_code', 'cr_await', 'ag_frame', 'ag_code',
+    'f_back', 'f_globals', 'f_locals', 'f_builtins', 'f_code', 'tb_frame', 'tb_next',
+    'func_globals', 'func_code', 'mro',
+}
+ALLOWED_DUNDER = {'__init__', '__str__', '__repr__'}
+
+SAFE_BUILTINS = {
+    'len': len, 'str': str, 'int': int, 'float': float, 'bool': bool, 'list': list, 'dict': dict,
+    'range': range, 'enumerate': enumerate, 'zip': zip, 'abs': abs, 'min': min, 'max': max,
+    'sum': sum, 'round': round,
+}
+
+def check_script_static(script):
+    """Reject scripts that try imports, dunder access, frame access or dangerous builtins.
+    Returns an error message, or None if the script passes."""
     try:
-        # Check if it's valid Python syntax
-        ast.parse(script)
-        
-        # Execute in restricted environment
-        test_network = IoTNetwork()
-        
-        # Create device classes that automatically register with test_network
-        def make_device_class(device_type):
-            class TestDevice(IoTDevice):
-                def __init__(self, device_id):
-                    super().__init__(device_id, device_type, test_network)
-                    # Manually register with network
-                    test_network.add_node(self)
-            return TestDevice
-        
-        # Create restricted globals with test-specific device classes
-        restricted_globals = {
-            '__builtins__': {
-                # Remove __import__ for security - prevent arbitrary imports
-                'len': len,
-                'str': str,
-                'int': int,
-                'float': float,
-                'bool': bool,
-                'list': list,
-                'dict': dict,
-                'range': range,
-                'enumerate': enumerate,
-                'zip': zip,
-                'abs': abs,
-                'min': min,
-                'max': max,
-                'sum': sum,
-                'round': round,
-            },
-            'print': print,  # Standard print for validation
-            'IoTNetwork': IoTNetwork,
-            'IoTDevice': IoTDevice,
-            # Add mock RPi module for GPIO simulation
-            'RPi': MockRPi(),
-            'GPIO': MockGPIO(),
-            # Add protocol factory and protocol classes
-            'create_protocol': create_protocol,
-            'I2C': I2C,
-            'SPI': SPI,
-            'UART': UART,
-            'CAN': CAN,
-            'WiFi': WiFi,
-            'BLE': BLE,
-            'Zigbee': Zigbee,
-            'LoRa': LoRa,
-            'MQTT': MQTT,
-            'CoAP': CoAP,
-            'EnergyModel': EnergyModel,
-            # Original devices
-            'Sensor': make_device_class('Sensor'),
-            'Gateway': make_device_class('Gateway'),
-            'Actuator': make_device_class('Actuator'),
-            'Camera': make_device_class('Camera'),
-            'Switch': make_device_class('Switch'),
-            'Router': make_device_class('Router'),
-            'Server': make_device_class('Server'),
-            'Cloud': make_device_class('Cloud'),
-            'Mobile': make_device_class('Mobile'),
-            'LED': make_device_class('LED'),
-            'Motor': make_device_class('Motor'),
-            'Display': make_device_class('Display'),
-            # Microcontrollers
-            'Arduino': make_device_class('Arduino'),
-            'ESP32': make_device_class('ESP32'),
-            'STM32': make_device_class('STM32'),
-            'PIC': make_device_class('PIC'),
-            # Single Board Computers
-            'RaspberryPi': make_device_class('RaspberryPi'),
-            'BeagleBone': make_device_class('BeagleBone'),
-            'JetsonNano': make_device_class('JetsonNano'),
-            # Communication Modules
-            'WiFi': make_device_class('WiFi'),
-            'Bluetooth': make_device_class('Bluetooth'),
-            'LoRa': make_device_class('LoRa'),
-            'Zigbee': make_device_class('Zigbee'),
-            # Power Management
-            'Battery': make_device_class('Battery'),
-            'PowerSupply': make_device_class('PowerSupply'),
-            'SolarPanel': make_device_class('SolarPanel'),
-            # Storage Devices
-            'SDCard': make_device_class('SDCard'),
-            'EEPROM': make_device_class('EEPROM'),
-            'FlashMemory': make_device_class('FlashMemory'),
-            'network': test_network
-        }
-        
-        # Capture output
-        old_stdout = sys.stdout
-        sys.stdout = captured_output = StringIO()
-        
-        try:
-            exec(script, restricted_globals)
-        finally:
-            sys.stdout = old_stdout
-        
-        # Allow scripts without devices - only check syntax
-        return True, "Valid Python script"
-        
+        tree = ast.parse(script)
     except SyntaxError as e:
-        return False, f"Syntax error: {e}"
-    except Exception as e:
-        return False, f"Error: {e}"
+        return f"Syntax error: {e}"
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            return "Imports are not allowed in scripts"
+        if isinstance(node, ast.Attribute):
+            if node.attr in DENIED_ATTRS or (node.attr.startswith('__') and node.attr not in ALLOWED_DUNDER):
+                return f"Attribute '{node.attr}' is not allowed"
+        elif isinstance(node, ast.Name):
+            if node.id in DENIED_NAMES or (node.id.startswith('__') and node.id not in ALLOWED_DUNDER):
+                return f"Name '{node.id}' is not allowed"
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str) and '__' in node.value:
+            return "Strings containing '__' are not allowed"
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            return "global/nonlocal are not allowed"
+    return None
+
+# Battery capacity presets (mAh). Sources: CR2032 Varta p.2 (230); Energizer E91 p.1 (2850, low drain);
+# EEMB LIR18650 p.1 (2600); LP652530 p.1 (500). Alkaline capacity falls at high drain.
+BATTERY_PRESETS = {
+    'CR2032': 230,
+    'AA2_ALKALINE': 2850,
+    'LI_ION_18650': 2600,
+    'LIPO_500': 500,
+}
+
+def build_script_globals(network, print_fn):
+    """Everything a script can see. Built inside the child process."""
+    def make_device_class(device_type):
+        class NetworkDevice(IoTDevice):
+            def __init__(self, device_id, battery_mah=0, protocol=None, memory_kb=None):
+                super().__init__(device_id, device_type, network, protocol, battery_mah, memory_kb)
+                network.add_node(self)
+        return NetworkDevice
+
+    g = {'__builtins__': dict(SAFE_BUILTINS), 'print': print_fn, 'network': network,
+         'IoTNetwork': IoTNetwork, 'IoTDevice': IoTDevice, 'RPi': MockRPi(), 'GPIO': MockGPIO(),
+         'create_protocol': create_protocol, 'EnergyModel': EnergyModel}
+    g.update(BATTERY_PRESETS)
+    # Protocol classes. "<Name>Protocol" aliases avoid the clash with the WiFi/LoRa/Zigbee device names.
+    for name in ('I2C', 'SPI', 'UART', 'CAN', 'WiFi', 'BLE', 'Zigbee', 'LoRa', 'MQTT', 'CoAP'):
+        cls = getattr(_proto, name)
+        g[name] = cls
+        g[name + 'Protocol'] = cls
+    # Device classes (these intentionally override WiFi / LoRa / Zigbee, as before)
+    for device_type in ('Sensor', 'Gateway', 'Actuator', 'Camera', 'Switch', 'Router', 'Server', 'Cloud',
+                        'Mobile', 'LED', 'Motor', 'Display', 'Arduino', 'ESP32', 'STM32', 'PIC',
+                        'RaspberryPi', 'BeagleBone', 'JetsonNano', 'WiFi', 'Bluetooth', 'LoRa', 'Zigbee',
+                        'Battery', 'PowerSupply', 'SolarPanel', 'SDCard', 'EEPROM', 'FlashMemory'):
+        g[device_type] = make_device_class(device_type)
+    return g
+
+def _script_worker(script, conn, duration_s=None, force=None):
+    """Runs in a separate process. Sends ('ok', result) or ('error', message)."""
+    try:
+        os.environ.clear()                      # no secrets (API keys) visible to the script
+        try:
+            import resource                     # Linux/macOS only; on Windows only the timeout applies
+            resource.setrlimit(resource.RLIMIT_CPU, (SCRIPT_TIMEOUT_S, SCRIPT_TIMEOUT_S))
+            resource.setrlimit(resource.RLIMIT_AS, (SCRIPT_MEMORY_BYTES, SCRIPT_MEMORY_BYTES))
+            resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))   # cannot write files
+        except ImportError:
+            pass
+        net = IoTNetwork()
+        printed = []
+        size = [0]
+        def script_print(*args, **kwargs):
+            text = ' '.join(str(a) for a in args)
+            if size[0] < MAX_PRINT_CHARS:
+                printed.append(text)
+                size[0] += len(text)
+        exec(compile(script, '<script>', 'exec'), build_script_globals(net, script_print))
+        simulation = None
+        if net.flows:
+            seconds = net.duration_s or duration_s or DEFAULT_DURATION_S
+            forced = None
+            if force:
+                forced = lambda: getattr(_proto, force[0])(**force[1])
+            simulation = run_simulation(net, seconds, default_protocol=_proto.WiFi, force_protocol=forced)
+        conn.send(('ok', {
+            'nodes': dict(net.nodes),
+            'edges': [list(e) for e in net.edges],
+            'states': dict(net.states),
+            'print_output': printed,
+            'simulation': simulation,
+        }))
+    except BaseException as e:
+        try:
+            conn.send(('error', f"{e}"))
+        except Exception:
+            pass
+    finally:
+        conn.close()
+
+def run_script_sandboxed(script, duration_s=None, force=None):
+    """Returns (ok, message, result). Script runs in a child process with a timeout and resource limits."""
+    problem = check_script_static(script)
+    if problem:
+        return False, problem, None
+    # fork on Linux/macOS (fast); spawn on Windows (slower, no resource limits)
+    method = os.environ.get('SANDBOX_START_METHOD') or ('fork' if 'fork' in multiprocessing.get_all_start_methods() else 'spawn')
+    ctx = multiprocessing.get_context(method)
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    proc = ctx.Process(target=_script_worker, args=(script, child_conn, duration_s, force), daemon=True)
+    proc.start()
+    child_conn.close()
+    try:
+        if parent_conn.poll(SCRIPT_TIMEOUT_S + (6 if method == 'spawn' else 1)):
+            status, payload = parent_conn.recv()
+        else:
+            return False, f"Script timed out after {SCRIPT_TIMEOUT_S} seconds", None
+    except EOFError:
+        return False, "Script was stopped (memory or CPU limit exceeded)", None
+    finally:
+        if proc.is_alive():
+            proc.terminate()
+        proc.join(1)
+        parent_conn.close()
+    if status == 'ok':
+        return True, "Valid Python script", payload
+    return False, f"Execution error: {payload}", None
+
+def validate_python_script(script: str):
+    ok, msg, _ = run_script_sandboxed(script)
+    return ok, msg
 
 # ---------- SIMULATOR ----------
 @app.route("/simulate", methods=["POST"])
@@ -474,169 +563,53 @@ def simulate():
     data = request.json or {}
     script = data.get("script", "")
 
-    ok, msg = validate_python_script(script)
+    duration_s = data.get("duration_s")
+    try:
+        duration_s = None if duration_s is None else min(max(float(duration_s), 1.0), MAX_DURATION_S)
+    except (TypeError, ValueError):
+        return jsonify({"error": "duration_s must be a number of seconds"}), 400
+
+    ok, msg, result = run_script_sandboxed(script, duration_s)
     if not ok:
         return jsonify({"error": msg}), 400
 
-    # Execute script to get network data
-    network = IoTNetwork()
-    
-    # Capture print output
-    print_output = []
-    def custom_print(*args, **kwargs):
-        output = ' '.join(str(arg) for arg in args)
-        print_output.append(output)
-        # Also print to console for debugging
-        print(f"[CAPTURED]: {output}")
-        return output  # Return for debugging
-    
-    # Test custom print
-    print(f"[DEBUG] Testing custom_print...")
-    custom_print("Test message")
-    print(f"[DEBUG] print_output after test: {print_output}")
-    
-    # Create device classes that automatically register with network
-    def make_device_class(device_type):
-        class NetworkDevice(IoTDevice):
-            def __init__(self, device_id):
-                super().__init__(device_id, device_type, network)
-                # Manually register with network
-                network.add_node(self)
-        return NetworkDevice
-    
-    restricted_globals = {
-        '__builtins__': {
-            # Remove __import__ for security - prevent arbitrary imports
-            # 'print': custom_print,  # Custom print for capturing output
-            'len': len,
-            'str': str,
-            'int': int,
-            'float': float,
-            'bool': bool,
-            'list': list,
-            'dict': dict,
-            'range': range,
-            'enumerate': enumerate,
-            'zip': zip,
-            'abs': abs,
-            'min': min,
-            'max': max,
-            'sum': sum,
-            'round': round,
-        },
-        'print': custom_print,  # Custom print outside __builtins__
-        'IoTNetwork': IoTNetwork,
-        'IoTDevice': IoTDevice,
-        # Add mock RPi module for GPIO simulation
-        'RPi': MockRPi(),
-        'GPIO': MockGPIO(),
-        # Add protocol factory and protocol classes
-        'create_protocol': create_protocol,
-        'I2C': I2C,
-        'SPI': SPI,
-        'UART': UART,
-        'CAN': CAN,
-        'WiFi': WiFi,
-        'BLE': BLE,
-        'Zigbee': Zigbee,
-        'LoRa': LoRa,
-        'MQTT': MQTT,
-        'CoAP': CoAP,
-        'EnergyModel': EnergyModel,
-        # Original devices
-        'Sensor': make_device_class('Sensor'),
-        'Gateway': make_device_class('Gateway'),
-        'Actuator': make_device_class('Actuator'),
-        'Camera': make_device_class('Camera'),
-        'Switch': make_device_class('Switch'),
-        'Router': make_device_class('Router'),
-        'Server': make_device_class('Server'),
-        'Cloud': make_device_class('Cloud'),
-        'Mobile': make_device_class('Mobile'),
-        'LED': make_device_class('LED'),
-        'Motor': make_device_class('Motor'),
-        'Display': make_device_class('Display'),
-        # Microcontrollers
-        'Arduino': make_device_class('Arduino'),
-        'ESP32': make_device_class('ESP32'),
-        'STM32': make_device_class('STM32'),
-        'PIC': make_device_class('PIC'),
-        # Single Board Computers
-        'RaspberryPi': make_device_class('RaspberryPi'),
-        'BeagleBone': make_device_class('BeagleBone'),
-        'JetsonNano': make_device_class('JetsonNano'),
-        # Communication Modules
-        'WiFi': make_device_class('WiFi'),
-        'Bluetooth': make_device_class('Bluetooth'),
-        'LoRa': make_device_class('LoRa'),
-        'Zigbee': make_device_class('Zigbee'),
-        # Power Management
-        'Battery': make_device_class('Battery'),
-        'PowerSupply': make_device_class('PowerSupply'),
-        'SolarPanel': make_device_class('SolarPanel'),
-        # Storage Devices
-        'SDCard': make_device_class('SDCard'),
-        'EEPROM': make_device_class('EEPROM'),
-        'FlashMemory': make_device_class('FlashMemory'),
-        'network': network
-    }
-    
-    try:
-        print(f"[DEBUG] Executing script...")
-        exec(script, restricted_globals)
-        print(f"[DEBUG] Script execution completed")
-    except Exception as e:
-        print(f"[DEBUG] Execution error: {e}")
-        return jsonify({"error": f"Execution error: {e}"}), 400
-
-    # Build cytoscape elements
+    nodes = result['nodes']
+    sim = result.get('simulation')
+    sim_nodes = sim['nodes'] if sim else {}
     elements = []
+    for nid, ntype in nodes.items():
+        node_data = {"id": nid, "label": f"{ntype} ({nid})", "type": ntype}
+        if nid in sim_nodes:
+            sn = sim_nodes[nid]
+            node_data.update({"energy": sn['energy_mj']['total'], "battery_pct": sn['battery_pct'],
+                              "node_state": sn['state'], "protocol": sn['protocol']})
+        elements.append({"data": node_data})
+    edge_info = {}
+    if sim:
+        for e in sim['edges']:
+            edge_info[(e['source'], e['target'])] = e
+    for src, tgt in result['edges']:
+        if src in nodes and tgt in nodes:
+            ed = {"source": src, "target": tgt}
+            e = edge_info.get((src, tgt))
+            if e:
+                ed.update({"protocol": e['protocol'], "load_pct": e['load_pct'], "loss_pct": e['loss_pct']})
+            elements.append({"data": ed})
 
-    # nodes
-    for nid, ntype in network.nodes.items():
-        elements.append({
-            "data": {
-                "id": nid,
-                "label": f"{ntype} ({nid})",
-                "type": ntype
-            }
-        })
-
-    # edges (only if both ends exist)
-    for s, t in network.edges:
-        if s in network.nodes and t in network.nodes:
-            elements.append({
-                "data": {
-                    "source": s,
-                    "target": t
-                }
-            })
-
-    # Check if any devices were created
-    has_devices = len(network.nodes) > 0
-    
-    # Debug logging
-    print(f"[DEBUG] has_devices: {has_devices}")
-    print(f"[DEBUG] print_output length: {len(print_output)}")
-    print(f"[DEBUG] print_output: {print_output}")
-    
-    # Build response
+    has_devices = len(nodes) > 0
     response_data = {
         "elements": elements,
-        "states": network.states,
+        "states": result['states'],
         "script": script,
-        "has_devices": has_devices
+        "has_devices": has_devices,
     }
-    
-    # If no devices, add print output or no devices message
+    if sim:
+        response_data["simulation"] = sim
     if not has_devices:
-        if print_output:
-            response_data["print_output"] = "\n".join(print_output)
-            response_data["message"] = "No IoT devices in script, but print output captured"
-        else:
-            response_data["print_output"] = ""
-            response_data["message"] = "No IoT devices in script and no print output"
-    
+        printed = result['print_output']
+        response_data["print_output"] = "\n".join(printed)
+        response_data["message"] = ("No IoT devices in script, but print output captured"
+                                    if printed else "No IoT devices in script and no print output")
     return jsonify(response_data)
 
 # ---------- SAVE/LOAD NETWORK FUNCTIONALITY ----------
@@ -652,7 +625,7 @@ def save_network():
         
         # Create filename with timestamp
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{name}_{timestamp}.json"
+        filename = f"{clean_name(name, 'unnetwork')}_{timestamp}.json"
         filepath = os.path.join(NETWORKS_DIR, filename)
         
         # Save network data
@@ -683,25 +656,13 @@ def load_network():
         if not filename:
             return jsonify({"error": "No filename provided"}), 400
         
-        # Validate filename - prevent path traversal
-        # Only allow alphanumeric, underscore, hyphen, and dot
-        if not re.match(r'^[\w\-\.]+$', filename):
-            return jsonify({"error": "Invalid filename"}), 400
-        
-        # Ensure filename ends with .json
         if not filename.endswith('.json'):
             return jsonify({"error": "Filename must end with .json"}), 400
-        
-        # Prevent path traversal
-        if '..' in filename or filename.startswith('/'):
+
+        filepath = safe_join(NETWORKS_DIR, filename)
+        if filepath is None:
             return jsonify({"error": "Invalid filename"}), 400
-        
-        filepath = os.path.join(NETWORKS_DIR, filename)
-        
-        # Ensure filepath is within NETWORKS_DIR
-        if not os.path.abspath(filepath).startswith(os.path.abspath(NETWORKS_DIR)):
-            return jsonify({"error": "Invalid filename"}), 400
-        
+
         if not os.path.exists(filepath):
             return jsonify({"error": "Network file not found"}), 404
         
@@ -749,25 +710,13 @@ def delete_network():
         if not filename:
             return jsonify({"error": "No filename provided"}), 400
         
-        # Validate filename - prevent path traversal
-        # Only allow alphanumeric, underscore, hyphen, and dot
-        if not re.match(r'^[\w\-\.]+$', filename):
-            return jsonify({"error": "Invalid filename"}), 400
-        
-        # Ensure filename ends with .json
         if not filename.endswith('.json'):
             return jsonify({"error": "Filename must end with .json"}), 400
-        
-        # Prevent path traversal
-        if '..' in filename or filename.startswith('/'):
+
+        filepath = safe_join(NETWORKS_DIR, filename)
+        if filepath is None:
             return jsonify({"error": "Invalid filename"}), 400
-        
-        filepath = os.path.join(NETWORKS_DIR, filename)
-        
-        # Ensure filepath is within NETWORKS_DIR
-        if not os.path.abspath(filepath).startswith(os.path.abspath(NETWORKS_DIR)):
-            return jsonify({"error": "Invalid filename"}), 400
-        
+
         if not os.path.exists(filepath):
             return jsonify({"error": "Network file not found"}), 404
         
@@ -790,8 +739,10 @@ def create_trace_file():
         
         # Generate unique filename with timestamp
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{script_name}_{timestamp}.tr"
-        filepath = os.path.join(TRACE_DIR, filename)
+        filename = f"{clean_name(script_name, 'unnamed_script')}_{timestamp}.tr"
+        filepath = safe_join(TRACE_DIR, filename)
+        if filepath is None:
+            return jsonify({"error": "Invalid filename"}), 400
         
         # Create trace file with header
         trace_content = f"""# IoT Simulator Trace File
@@ -830,7 +781,9 @@ def append_trace():
         if not trace_file or not events:
             return jsonify({"error": "Missing trace file or events"}), 400
         
-        filepath = os.path.join(TRACE_DIR, trace_file)
+        filepath = safe_join(TRACE_DIR, trace_file)
+        if filepath is None:
+            return jsonify({"error": "Invalid filename"}), 400
         
         # Append events to trace file
         with open(filepath, 'a') as f:
@@ -896,7 +849,9 @@ def delete_trace_file():
         if not filename:
             return jsonify({"error": "Missing filename"}), 400
         
-        filepath = os.path.join(TRACE_DIR, filename)
+        filepath = safe_join(TRACE_DIR, filename)
+        if filepath is None:
+            return jsonify({"error": "Invalid filename"}), 400
         
         if not os.path.exists(filepath):
             return jsonify({"error": "Trace file not found"}), 404
@@ -906,6 +861,97 @@ def delete_trace_file():
         
     except Exception as e:
         return jsonify({"error": f"Failed to delete trace file: {e}"}), 500
+
+
+# ---------- RECOMMENDATION BY SIMULATION ----------
+# Candidate protocol setups that are tried for the whole network: name -> (protocol class, parameters)
+RECOMMEND_CANDIDATES = {
+    'BLE': ('BLE', {}),
+    'WiFi': ('WiFi', {}),
+    'Zigbee': ('Zigbee', {}),
+    'LoRa SF7': ('LoRa', {'spreading_factor': 7}),
+    'LoRa SF9': ('LoRa', {'spreading_factor': 9}),
+    'LoRa SF12': ('LoRa', {'spreading_factor': 12}),
+}
+
+def network_lifetime_s(sim):
+    """Time until the first battery node dies (measured if it died, projected from the drain rate if not)"""
+    values = []
+    for n in sim['nodes'].values():
+        if n['battery_pct'] is None:
+            continue
+        if n['died_at_s'] is not None:
+            values.append(n['died_at_s'])
+        elif n['projected_lifetime_s'] is not None:
+            values.append(n['projected_lifetime_s'])
+    return min(values) if values else None
+
+@app.route("/recommend_by_simulation", methods=["POST"])
+def recommend_by_simulation():
+    """Run the script's traffic once per protocol option and rank the options by network lifetime"""
+    import time as _time
+    data = request.json or {}
+    script = data.get("script", "")
+    constraints = data.get("constraints") or {}
+    try:
+        duration_s = data.get("duration_s")
+        duration_s = None if duration_s is None else min(max(float(duration_s), 1.0), MAX_DURATION_S)
+        max_latency_ms = constraints.get("max_latency_ms")
+        max_latency_ms = None if max_latency_ms in (None, "") else float(max_latency_ms)
+        min_delivery = constraints.get("min_delivery_ratio", 0.9)
+        min_delivery = 0.9 if min_delivery in (None, "") else float(min_delivery)
+    except (TypeError, ValueError):
+        return jsonify({"error": "duration_s and constraints must be numbers"}), 400
+
+    names = data.get("candidates") or list(RECOMMEND_CANDIDATES)
+    if not isinstance(names, list) or not names or len(names) > 8 or any(n not in RECOMMEND_CANDIDATES for n in names):
+        return jsonify({"error": f"candidates must be a list of: {', '.join(RECOMMEND_CANDIDATES)}"}), 400
+
+    started = _time.time()
+    results = []
+    has_battery = False
+    for name in names:
+        if _time.time() - started > 40:
+            results.append({"name": name, "error": "skipped (time limit)"})
+            continue
+        proto_name, kwargs = RECOMMEND_CANDIDATES[name]
+        ok, msg, res = run_script_sandboxed(script, duration_s, force=(proto_name, kwargs))
+        if not ok:
+            return jsonify({"error": msg}), 400
+        sim = res.get('simulation')
+        if not sim:
+            return jsonify({"error": "The script has no traffic. Add device.send_interval(seconds, payload_bytes, to=gateway)."}), 400
+        s = sim['summary']
+        life = network_lifetime_s(sim)
+        has_battery = has_battery or any(n['battery_pct'] is not None for n in sim['nodes'].values())
+        reasons = []
+        if s['delivery_ratio'] is None or s['delivery_ratio'] < min_delivery:
+            got = 'none delivered' if s['delivery_ratio'] is None else f"{s['delivery_ratio'] * 100:.1f}%"
+            reasons.append(f"delivery {got} is below {min_delivery * 100:.0f}%")
+        if max_latency_ms is not None and (s['avg_latency_ms'] is None or s['avg_latency_ms'] > max_latency_ms):
+            reasons.append(f"average latency {s['avg_latency_ms']} ms is above {max_latency_ms:g} ms")
+        results.append({
+            "name": name, "protocol": proto_name, "parameters": kwargs,
+            "delivery_ratio": s['delivery_ratio'], "avg_latency_ms": s['avg_latency_ms'],
+            "lifetime_s": life, "first_node_death_s": s['first_node_death_s'],
+            "first_flow_disconnected_s": s['first_flow_disconnected_s'],
+            "total_energy_mj": s['total_energy_mj'], "truncated": sim['truncated'],
+            "meets_constraints": not reasons, "fails_because": reasons,
+        })
+
+    def rank_key(r):
+        life = r.get("lifetime_s")
+        return (-(life if life is not None else -1), r.get("total_energy_mj", 0))
+    ok_results = sorted([r for r in results if r.get("meets_constraints")], key=rank_key)
+    failed = [r for r in results if not r.get("meets_constraints")]
+    best = ok_results[0]["name"] if ok_results else None
+    notes = ["Lifetime = time until the first battery node dies (measured if it died during the run, otherwise projected from its drain rate)."]
+    if not has_battery:
+        notes.append("No device has battery_mah, so options are ranked by total energy. Add battery_mah to compare lifetime.")
+    if any(r.get("truncated") for r in results):
+        notes.append("Some runs were cut short to stay within the time budget; use a shorter duration or fewer devices.")
+    return jsonify({"best": best, "ranked": ok_results, "excluded": failed, "constraints": {
+        "max_latency_ms": max_latency_ms, "min_delivery_ratio": min_delivery}, "notes": notes})
 
 # ---------- RECOMMENDATION ENGINE ENDPOINTS ----------
 @app.route("/recommend_protocol", methods=["POST"])
@@ -995,7 +1041,9 @@ IOT_SIMULATOR_SYSTEM_PROMPT = """You are an expert AI assistant for the IoT Netw
 **Key Features:**
 - Multi-layer visualization (Device, Protocol, Energy, DataFlow)
 - Protocol support: I2C, SPI, UART, WiFi, BLE, LoRa, Zigbee, MQTT, CoAP, CAN
-- Import support: json, datetime, math, and other standard Python modules
+- Scripts cannot use import statements; devices, protocols and math helpers are pre-loaded
+- Battery & timing: Device(name, battery_mah=220) or a preset (CR2032, AA2_ALKALINE, LI_ION_18650, LIPO_500), dev.set_protocol(LoRa(spreading_factor=9)), dev.send_interval(60, payload_bytes=20, to='gw'), network.set_duration(3600)
+- 'Recommend' button runs the event engine per protocol and ranks by network lifetime
 - Export: JSON export with performance metrics
 - Trace files: Single-line format with energy and latency data
 
@@ -1015,15 +1063,13 @@ IOT_SIMULATOR_SYSTEM_PROMPT = """You are an expert AI assistant for the IoT Netw
 When generating scripts, always provide complete, runnable code. When answering questions, be specific to the IoT simulator context."""
 
 def call_openai_api(user_query):
-    """Call OpenAI API for intelligent responses"""
+    """Call OpenAI (openai>=1.0 client). Model via OPENAI_MODEL env var."""
     if not OPENAI_AVAILABLE or not OPENAI_API_KEY:
         return None, "OpenAI not available"
-    
     try:
-        openai.api_key = OPENAI_API_KEY
-        
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
+        client = openai.OpenAI(api_key=OPENAI_API_KEY)
+        response = client.chat.completions.create(
+            model=os.environ.get('OPENAI_MODEL', 'gpt-4o-mini'),
             messages=[
                 {"role": "system", "content": IOT_SIMULATOR_SYSTEM_PROMPT},
                 {"role": "user", "content": user_query}
@@ -1031,13 +1077,31 @@ def call_openai_api(user_query):
             max_tokens=1000,
             temperature=0.7
         )
-        
         return response.choices[0].message.content, "openai"
     except Exception as e:
         return None, f"OpenAI API error: {e}"
 
 # Script generation templates
 SCRIPT_TEMPLATES = {
+    "battery": """# Example script for the editor: battery sensors -> two relays -> gateway.
+# Relay r1 has a small battery, so it dies and traffic is re-routed through r2.
+# Paste into the editor, click Run (default 1 hour), or call /simulate with "duration_s".
+
+g  = Gateway("gw");  g.turn_on()
+r1 = Router("r1", battery_mah=0.5, protocol=BLEProtocol()); r1.turn_on()   # tiny battery on purpose
+r2 = Router("r2", protocol=BLEProtocol());                  r2.turn_on()
+s1 = Sensor("s1", battery_mah=220, protocol=BLEProtocol()); s1.turn_on()
+s2 = Sensor("s2", battery_mah=220, protocol=BLEProtocol()); s2.turn_on()
+
+s1.connect(r1, distance_m=8);  s1.connect(r2, distance_m=12)
+s2.connect(r1, distance_m=10); s2.connect(r2, distance_m=15)
+r1.connect(g, distance_m=20)
+r2.connect(g, distance_m=20)
+
+s1.send_interval(10, 20, to=g)     # every 10 s, 20-byte payload
+s2.send_interval(15, 20, to=g)
+network.set_duration(600)          # simulate 10 minutes
+""",
     "smart home": """# Smart Home IoT Network
 # Temperature sensor and LED control
 
@@ -1161,7 +1225,7 @@ KNOWLEDGE_BASE = {
     "simulator": "The IoT Network Simulator is a Python-based simulation platform for designing, testing, and analyzing IoT networks. It features: 1) Web-based editor for writing IoT scripts, 2) Multi-layer network visualization (Device, Protocol, Energy, DataFlow), 3) Support for 10 IoT protocols (I2C, SPI, UART, WiFi, BLE, LoRa, Zigbee, MQTT, CoAP, CAN), 4) Resource-constrained device modeling, 5) Energy-aware simulation with performance metrics, 6) Single-line trace file generation for analysis, 7) AI-powered chatbot for script generation and Q&A.",
     "purpose": "The purpose of this IoT simulator is to provide a comprehensive platform for designing, testing, and analyzing IoT networks without requiring physical hardware. It enables researchers, students, and developers to prototype IoT systems, analyze protocol performance, and visualize network behavior in a controlled environment.",
     "goal": "The goal of this IoT simulator is to bridge the gap between theoretical IoT concepts and practical implementation by providing a realistic simulation environment that models device behavior, protocol characteristics, energy consumption, and network topology.",
-    "features": "Key features include: Web-based Python editor, Multi-layer visualization (Device/Protocol/Energy/DataFlow), 10 IoT protocols (I2C/SPI/UART/WiFi/BLE/LoRa/Zigbee/MQTT/CoAP/CAN), Resource-constrained device modeling, Energy-aware simulation, Performance metrics, Trace file generation, AI chatbot assistant, Import support for Python modules.",
+    "features": "Key features include: Web-based Python editor, Multi-layer visualization (Device/Protocol/Energy/DataFlow), 10 IoT protocols (I2C/SPI/UART/WiFi/BLE/LoRa/Zigbee/MQTT/CoAP/CAN), Resource-constrained device modeling, Energy-aware simulation, Performance metrics, Trace file generation, AI chatbot assistant, Battery-aware event simulation with protocol recommendation.",
     "how to use": "To use the IoT simulator: 1) Write your script in the editor using device classes like Arduino, Sensor, LED. 2) Click 'Run Simulation' to execute. 3) View the network visualization. 4) Use multi-layer view by clicking 'Layer' button.",
     "multi-layer": "Multi-layer visualization shows different aspects: Device layer (device types), Protocol layer (communication protocols), Energy layer (power consumption), DataFlow layer (data intensity). Click 'Layer' button to cycle through them.",
     "export": "To export data: Click 'Export' button to download JSON file with complete simulation data including devices, protocols, and performance metrics.",
@@ -1169,11 +1233,11 @@ KNOWLEDGE_BASE = {
     "devices": "Available devices: Arduino, ESP32, STM32, PIC (microcontrollers), Sensor, Camera, LED, Motor, Display (I/O devices), Gateway, Router, Server, Cloud (network devices).",
     "protocols": "The simulator supports IoT protocols: I2C, SPI, UART, WiFi, BLE, LoRa, Zigbee, MQTT, CoAP, CAN. Each protocol has specific timing and energy characteristics.",
     "pause": "Pause/Resume button allows you to stop the simulation and continue from the exact same point. It preserves all device states and packet positions.",
-    "import": "You can now use Python imports in the editor! Import modules like json, datetime, math, etc. for advanced scripting.",
+    "import": "Import statements are blocked in the sandboxed editor for security. Devices, protocols and math helpers are already available without importing.",
     "script": "Scripts use simple Python syntax with device classes. Example: arduino = Arduino('uno'); sensor = Sensor('temp'); sensor.connect(arduino); arduino.turn_on()",
     "error": "Common errors: Check device names are unique, ensure devices are connected before use, verify turn_on() is called before operations.",
     "help": "I can help you with: Creating IoT scripts for any scenario (smart home, industrial, smart city, etc.), Answering questions about simulator features, Troubleshooting script errors, Explaining protocols and devices, Providing usage examples. Just ask your question!",
-    "support": "Supported features: Script generation, Q&A about simulator, Multi-layer visualization, Protocol simulation, Device modeling, Energy analysis, Trace file generation, Export functionality, Import support, AI chatbot assistance.",
+    "support": "Supported features: Script generation, Q&A about simulator, Multi-layer visualization, Protocol simulation, Device modeling, Energy analysis, Trace file generation, Export functionality, AI chatbot assistance.",
     "example": "Example script: arduino = Arduino('uno'); sensor = Sensor('temp'); led = LED('status'); sensor.connect(arduino); arduino.connect(led); arduino.turn_on(); sensor.turn_on(); led.turn_on();",
     "tutorial": "Quick tutorial: 1) Open editor at /editor, 2) Write script using device classes, 3) Click Run Simulation, 4) View network visualization, 5) Use Layer button for different views, 6) Click Export for JSON data.",
     "network": "Network creation: Use device classes (Arduino, Sensor, LED, etc.), Connect devices with .connect() method, Turn on devices with .turn_on(), Run simulation to visualize network.",
@@ -1182,7 +1246,7 @@ KNOWLEDGE_BASE = {
     "energy": "Energy simulation: Models power consumption based on device type and protocol, Calculates energy per transmission, Shows energy metrics in visualization, Available in Energy layer view.",
     "latency": "Latency modeling: Calculates transmission delay based on protocol characteristics, Shows latency in trace files, Displays in performance metrics, Varies by protocol type.",
     "performance": "Performance metrics: Total energy consumption, Average latency, Packet transmission count, Device utilization, Network throughput. Available in export JSON.",
-    "advanced": "Advanced features: Python import support, Custom device classes, Protocol library integration, Trace file analysis, Performance optimization, Network topology design.",
+    "advanced": "Advanced features: Custom device classes, Protocol library integration, Trace file analysis, Performance optimization, Network topology design.",
     "beginner": "For beginners: Start with simple scripts (sensor + LED), Use Load Example button, Try the AI chatbot for help, Read the documentation, Experiment with different devices.",
     "student": "For students: Great for learning IoT concepts, Practice network design, Understand protocol behavior, Analyze energy consumption, Prepare for projects.",
     "research": "For researchers: Analyze protocol performance, Compare network topologies, Study energy efficiency, Generate trace data, Validate IoT algorithms.",
@@ -1451,4 +1515,4 @@ def simulation():
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=os.environ.get("FLASK_DEBUG") == "1")
